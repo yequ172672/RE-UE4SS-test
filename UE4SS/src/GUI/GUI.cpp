@@ -72,12 +72,30 @@ namespace RC::GUI
             ImGui::SetNextWindowPos({0, 0});
             auto current_window_size = m_os_backend->is_valid() ? m_os_backend->get_window_size() : m_gfx_backend->get_window_size();
             ImGui::SetNextWindowSize({static_cast<float>(current_window_size.x), static_cast<float>(current_window_size.y)});
+            const bool overlay_mode = UE4SSProgram::settings_manager.Debug.OverlayMode;
             ImGui::Begin("MainWindow",
                          &show_window,
                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+                                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                                 (overlay_mode ? ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoBringToFrontOnFocus : ImGuiWindowFlags_None));
 
-            if (ImGui::BeginTabBar("##MainTabBar", ImGuiTabBarFlags_None))
+            if (overlay_mode)
+            {
+                // Overlay mode: render mod windows directly on a transparent
+                // backdrop so the game stays visible underneath, without the
+                // UE4SS tab bar.
+                {
+                    std::lock_guard<std::mutex> guard(m_tabs_mutex);
+                    for (const auto& tab : m_tabs)
+                    {
+                        if (tab->render_function)
+                        {
+                            tab->render_function(tab->get_owner());
+                        }
+                    }
+                }
+            }
+            else if (ImGui::BeginTabBar("##MainTabBar", ImGuiTabBarFlags_None))
             {
                 if (ImGui::BeginTabItem(ICON_FA_TERMINAL " Console"))
                 {
