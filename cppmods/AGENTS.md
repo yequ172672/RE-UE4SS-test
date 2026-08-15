@@ -10,12 +10,13 @@
 | --- | --- | --- |
 | `EventViewerMod/` | 多 Hook 的高频调用采集与 ImGui 查看器 | `EventViewerMod/AGENTS.md` |
 | `KismetDebuggerMod/` | Kismet 断点/单步调试 | `KismetDebuggerMod/AGENTS.md` |
+| `MeshTreeMod/` | 主角组件树覆层 UI（Hide/Show 控制，配合 `[Debug] OverlayMode`） | — |
 
 ## 关键文件
 
 | 文件 | 作用 |
 | --- | --- |
-| `CMakeLists.txt` | 注册当前两个 Mod 子目录。 |
+| `CMakeLists.txt` | 注册当前三个 Mod 子目录。 |
 | `xmake.lua` | xmake Mod 入口；当前只包含 KismetDebugger，存在已知构建不对称。 |
 | `<Mod>/src/dllmain.cpp` | Mod DLL 导出入口。 |
 | `<Mod>/CMakeLists.txt` | shared library target、UE4SS/ImGui 及 Mod 私有依赖。 |
