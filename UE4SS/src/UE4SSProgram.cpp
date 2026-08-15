@@ -11,6 +11,7 @@
 #include <format>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <unordered_set>
 #include <fmt/chrono.h>
 #include <Profiler/Profiler.hpp>
@@ -26,6 +27,7 @@
 #include <Helpers/Time.hpp>
 #include <IniParser/Ini.hpp>
 #include <LuaLibrary.hpp>
+#include <McpServer.hpp>
 #include <LuaType/LuaCustomProperty.hpp>
 #include <LuaType/LuaUObject.hpp>
 #include <Mod/CppMod.hpp>
@@ -97,6 +99,126 @@ namespace RC
     //*/
 
     SettingsManager UE4SSProgram::settings_manager{};
+
+    namespace
+    {
+        constexpr File::CharType game_config_directory_name[] = STR("CustomGameConfigs");
+        constexpr File::CharType game_config_metadata_file_name[] = STR("GameConfig.ini");
+        constexpr File::CharType compatibility_settings_file_name[] = STR("UE4SS-compatibility.ini");
+
+        struct GameIdentity
+        {
+            File::StringType executable_name;
+            File::StringType project_name;
+            File::StringType install_directory_name;
+        };
+
+        auto normalize_game_identifier(File::StringViewType identifier) -> File::StringType
+        {
+            File::StringType normalized;
+            normalized.reserve(identifier.size());
+            for (const auto character : identifier)
+            {
+                if (std::iswalnum(static_cast<wint_t>(character)))
+                {
+                    normalized.push_back(static_cast<File::CharType>(std::towlower(static_cast<wint_t>(character))));
+                }
+            }
+            return normalized;
+        }
+
+        auto metadata_matches_game(const std::filesystem::path& directory, const GameIdentity& identity) -> std::optional<bool>
+        {
+            const auto metadata_path = directory / game_config_metadata_file_name;
+            if (!std::filesystem::is_regular_file(metadata_path))
+            {
+                return std::nullopt;
+            }
+
+            auto file = File::open(metadata_path, File::OpenFor::Reading, File::OverwriteExistingFile::No, File::CreateIfNonExistent::No);
+            Ini::Parser parser;
+            parser.parse(file);
+            file.close();
+
+            constexpr File::CharType section_game[] = STR("Game");
+            bool has_selector{};
+            bool matches = true;
+            const auto match_selector = [&](const File::StringType& key, File::StringViewType actual) {
+                try
+                {
+                    const auto configured = parser.get_string(section_game, key);
+                    if (!configured.empty())
+                    {
+                        has_selector = true;
+                        matches = matches && normalize_game_identifier(configured) == normalize_game_identifier(actual);
+                    }
+                }
+                catch (const std::exception&)
+                {
+                }
+            };
+
+            match_selector(STR("ExecutableName"), identity.executable_name);
+            match_selector(STR("ProjectName"), identity.project_name);
+            match_selector(STR("InstallDirectoryName"), identity.install_directory_name);
+            return has_selector && matches;
+        }
+
+        auto folder_name_matches_game(const std::filesystem::path& directory, const GameIdentity& identity) -> bool
+        {
+            const auto folder_name = normalize_game_identifier(ensure_str(directory.filename()));
+            return folder_name == normalize_game_identifier(identity.executable_name) || folder_name == normalize_game_identifier(identity.project_name) ||
+                   folder_name == normalize_game_identifier(identity.install_directory_name);
+        }
+
+        auto find_automatic_game_config(const std::vector<std::filesystem::path>& search_roots, const GameIdentity& identity)
+                -> std::optional<std::filesystem::path>
+        {
+            std::optional<std::filesystem::path> fallback;
+            for (const auto& search_root : search_roots)
+            {
+                if (!std::filesystem::is_directory(search_root))
+                {
+                    continue;
+                }
+
+                std::vector<std::filesystem::path> directories;
+                for (const auto& item : std::filesystem::directory_iterator(search_root))
+                {
+                    if (item.is_directory())
+                    {
+                        directories.emplace_back(item.path());
+                    }
+                }
+                std::ranges::sort(directories);
+
+                for (const auto& directory : directories)
+                {
+                    try
+                    {
+                        if (const auto metadata_match = metadata_matches_game(directory, identity); metadata_match.has_value())
+                        {
+                            if (*metadata_match)
+                            {
+                                return directory;
+                            }
+                            continue;
+                        }
+                    }
+                    catch (const std::exception&)
+                    {
+                        continue;
+                    }
+
+                    if (!fallback && folder_name_matches_game(directory, identity))
+                    {
+                        fallback = directory;
+                    }
+                }
+            }
+            return fallback;
+        }
+    } // namespace
 
 #define OUTPUT_MEMBER_OFFSETS_FOR_STRUCT(StructName)                                                                                                           \
     for (const auto& [name, offset] : Unreal::StructName::MemberOffsets)                                                                                       \
@@ -201,6 +323,10 @@ namespace RC
             try
             {
                 settings_manager.deserialize(m_settings_path_and_file);
+                if (!m_settings_override_path.empty())
+                {
+                    settings_manager.deserialize(m_settings_override_path);
+                }
             }
             catch (std::exception& e)
             {
@@ -353,14 +479,20 @@ namespace RC
 
             if (m_has_game_specific_config)
             {
-                Output::send(STR("Found configuration for game: {}\n"), ensure_str(m_working_directory.filename()));
+                const auto& config_directory = m_game_config_directory.empty() ? m_working_directory : m_game_config_directory;
+                Output::send(STR("Found configuration for game: {}\n"), ensure_str(config_directory.filename()));
             }
             else
             {
                 Output::send(STR("No specific game configuration found, using default configuration file\n"));
             }
 
-            Output::send(STR("Config: {}\n\n"), ensure_str(m_settings_path_and_file));
+            Output::send(STR("Config: {}\n"), ensure_str(m_settings_path_and_file));
+            if (!m_settings_override_path.empty())
+            {
+                Output::send(STR("Compatibility config: {}\n"), ensure_str(m_settings_override_path));
+            }
+            Output::send(STR("\n"));
             Output::send(STR("root directory: {}\n"), ensure_str(m_root_directory));
             Output::send(STR("working directory: {}\n"), ensure_str(m_working_directory));
             Output::send(STR("game executable directory: {}\n"), ensure_str(m_game_executable_directory));
@@ -373,6 +505,19 @@ namespace RC
             Output::send(STR("\n"));
             Output::send(STR("log directory: {}\n"), ensure_str(m_log_directory));
             Output::send(STR("object dumper directory: {}\n\n\n"), ensure_str(m_object_dumper_output_directory));
+            if (settings_manager.Mcp.Enabled)
+            {
+                const auto port = static_cast<uint16_t>(std::clamp<int64_t>(settings_manager.Mcp.Port, 0, std::numeric_limits<uint16_t>::max()));
+                m_mcp_server = std::make_unique<Mcp::Server>(*this,
+                                                             to_string(settings_manager.Mcp.BindAddress),
+                                                             port,
+                                                             settings_manager.Mcp.OperationTimeoutMs,
+                                                             settings_manager.Mcp.DevelopmentMode);
+                if (!m_mcp_server->start())
+                {
+                    m_mcp_server.reset();
+                }
+            }
         }
         catch (std::runtime_error& e)
         {
@@ -456,53 +601,83 @@ namespace RC
         ProfilerScope();
         m_root_directory = moduleFilePath.parent_path();
         m_module_file_path = moduleFilePath;
-
-        // The default working directory is the root directory
-        // Can be changed by creating a <GameName> directory in the root directory
-        // At that point, the working directory will be "root/<GameName>"
         m_working_directory = m_root_directory;
 
         wchar_t exe_path_buffer[1024];
         GetModuleFileNameW(GetModuleHandle(nullptr), exe_path_buffer, 1023);
-        std::filesystem::path game_exe_path = exe_path_buffer;
-        std::filesystem::path game_directory_path = game_exe_path.parent_path();
+        const std::filesystem::path game_exe_path = exe_path_buffer;
+        const std::filesystem::path game_directory_path = game_exe_path.parent_path();
         m_legacy_root_directory = game_directory_path;
-
-        m_working_directory = m_root_directory;
         m_game_executable_directory = game_directory_path;
-        m_settings_path_and_file = m_root_directory;
         m_game_path_and_exe_name = game_exe_path;
-        m_object_dumper_output_directory = m_working_directory;
+        m_log_directory = m_root_directory;
+        m_object_dumper_output_directory = m_root_directory;
 
-        // Allow loading of DLLs from the game directory
+        m_default_settings_path_and_file = m_root_directory / m_settings_file_name;
+        if (const auto legacy_settings = m_legacy_root_directory / m_settings_file_name;
+            std::filesystem::exists(legacy_settings) && !std::filesystem::exists(m_default_settings_path_and_file))
+        {
+            m_default_settings_path_and_file = legacy_settings;
+        }
+        m_settings_path_and_file = m_default_settings_path_and_file;
+
+        // Allow loading of DLLs from the game directory.
         AddDllDirectory(game_exe_path.c_str());
 
+        // Preserve the legacy layout where a game-named directory is extracted directly beside UE4SS.dll.
+        const auto legacy_game_directory_name = game_directory_path.parent_path().parent_path().parent_path().filename();
+        std::vector<std::filesystem::path> legacy_directories;
         for (const auto& item : std::filesystem::directory_iterator(m_root_directory))
         {
-            if (!item.is_directory())
+            if (item.is_directory())
+            {
+                legacy_directories.emplace_back(item.path());
+            }
+        }
+        std::ranges::sort(legacy_directories);
+        for (const auto& directory : legacy_directories)
+        {
+            if (directory.filename() != legacy_game_directory_name)
             {
                 continue;
             }
 
-            if (item.path().filename() == game_directory_path.parent_path().parent_path().parent_path().filename())
+            m_has_game_specific_config = true;
+            m_working_directory = directory;
+            m_game_config_directory = directory;
+            m_log_directory = directory;
+            m_object_dumper_output_directory = directory;
+            if (const auto settings = directory / m_settings_file_name; std::filesystem::exists(settings))
             {
-                m_has_game_specific_config = true;
-                m_working_directory = item.path();
-                m_settings_path_and_file = std::move(item.path());
-                m_log_directory = m_working_directory;
-                m_object_dumper_output_directory = m_working_directory;
-                m_legacy_root_directory = m_legacy_root_directory / item.path();
-                break;
+                m_settings_path_and_file = settings;
             }
+            return;
         }
 
-        m_log_directory = m_working_directory;
-        m_settings_path_and_file.append(m_settings_file_name);
-
-        // Check for legacy locations and update paths accordingly
-        if (std::filesystem::exists(m_legacy_root_directory / m_settings_file_name) && !std::filesystem::exists(m_settings_path_and_file))
+        const GameIdentity identity{
+                .executable_name = ensure_str(game_exe_path.filename()),
+                .project_name = ensure_str(game_directory_path.parent_path().parent_path().filename()),
+                .install_directory_name = ensure_str(legacy_game_directory_name),
+        };
+        const std::vector<std::filesystem::path> automatic_search_roots{
+                m_root_directory / game_config_directory_name,
+                m_game_executable_directory / game_config_directory_name,
+        };
+        const auto automatic_config = find_automatic_game_config(automatic_search_roots, identity);
+        if (!automatic_config)
         {
-            m_settings_path_and_file = m_legacy_root_directory / m_settings_file_name;
+            return;
+        }
+
+        m_has_game_specific_config = true;
+        m_game_config_directory = *automatic_config;
+        if (const auto compatibility_settings = *automatic_config / compatibility_settings_file_name; std::filesystem::is_regular_file(compatibility_settings))
+        {
+            m_settings_override_path = compatibility_settings;
+        }
+        else if (const auto game_settings = *automatic_config / m_settings_file_name; std::filesystem::is_regular_file(game_settings))
+        {
+            m_settings_override_path = game_settings;
         }
     }
 
@@ -563,7 +738,12 @@ namespace RC
 
     auto UE4SSProgram::load_unreal_offsets_from_file() -> void
     {
-        std::filesystem::path file_path = m_working_directory / "MemberVariableLayout.ini";
+        const auto config_directory = m_game_config_directory.empty() ? m_working_directory : m_game_config_directory;
+        std::filesystem::path file_path = config_directory / "MemberVariableLayout.ini";
+        if (!std::filesystem::exists(file_path) && config_directory != m_working_directory)
+        {
+            file_path = m_working_directory / "MemberVariableLayout.ini";
+        }
         if (std::filesystem::exists(file_path))
         {
             auto file = File::open(file_path);
@@ -653,13 +833,23 @@ namespace RC
             }
         }
 
-        // If any Lua scripts are found, add overrides so that the Lua script can perform the aob scan instead of the Unreal API itself
+        // If any Lua scripts are found, add overrides so that the Lua script can perform the AOB scan instead of the Unreal API itself.
         setup_lua_scan_overrides(m_working_directory, config);
+        if (!m_game_config_directory.empty() && m_game_config_directory != m_working_directory)
+        {
+            setup_lua_scan_overrides(m_game_config_directory, config);
+        }
 
         // Virtual function offset overrides
         TRY([&]() {
             ProfilerScopeNamed("loading virtual function offset overrides");
-            static File::StringType virtual_function_offset_override_file{ensure_str((m_working_directory / STR("VTableLayout.ini")))};
+            const auto config_directory = m_game_config_directory.empty() ? m_working_directory : m_game_config_directory;
+            auto virtual_function_offset_override_path = config_directory / STR("VTableLayout.ini");
+            if (!std::filesystem::exists(virtual_function_offset_override_path) && config_directory != m_working_directory)
+            {
+                virtual_function_offset_override_path = m_working_directory / STR("VTableLayout.ini");
+            }
+            const auto virtual_function_offset_override_file = ensure_str(virtual_function_offset_override_path);
             if (std::filesystem::exists(virtual_function_offset_override_file))
             {
                 auto file =
@@ -969,11 +1159,19 @@ namespace RC
 
         if (settings_manager.Debug.RenderMode == GUI::RenderMode::EngineTick)
         {
-            Hook::RegisterEngineTickPostCallback([](auto&,...){gui_render_thread_tick(); }, {false, false, STR("UE4SS"), STR("ImGuiRenderHook")});
+            Hook::RegisterEngineTickPostCallback(
+                    [](auto&, ...) {
+                        gui_render_thread_tick();
+                    },
+                    {false, false, STR("UE4SS"), STR("ImGuiRenderHook")});
         }
         else if (settings_manager.Debug.RenderMode == GUI::RenderMode::GameViewportClientTick)
         {
-            Hook::RegisterGameViewportClientTickPostCallback([](auto&,...){gui_render_thread_tick(); }, {false, false, STR("UE4SS"), STR("ImGuiRenderHook")});
+            Hook::RegisterGameViewportClientTickPostCallback(
+                    [](auto&, ...) {
+                        gui_render_thread_tick();
+                    },
+                    {false, false, STR("UE4SS"), STR("ImGuiRenderHook")});
         }
 
         if (settings_manager.Debug.DebugConsoleEnabled)
@@ -1078,6 +1276,10 @@ namespace RC
             fire_program_start_for_cpp_mods();
             start_lua_mods();
         });
+        if (m_mcp_server)
+        {
+            m_mcp_server->activate_runtime();
+        }
 
         if (settings_manager.General.EnableDebugKeyBindings)
         {
@@ -1093,6 +1295,7 @@ namespace RC
         m_event_loop_thread_id = std::this_thread::get_id();
 
         on_program_start();
+        m_is_program_started = true;
 
         FilesystemWatcher filesystem_watcher{};
         if (settings_manager.General.EnableAutoReloadingLuaMods)
@@ -1229,40 +1432,59 @@ namespace RC
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             ProfilerFrameMark();
         }
+        m_is_program_started = false;
+        if (m_mcp_server)
+        {
+            m_mcp_server->stop();
+        }
         Output::send(STR("Event loop end\n"));
     }
 
     auto UE4SSProgram::setup_unreal_properties() -> void
     {
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("ObjectProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_objectproperty);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("ObjectProperty"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_objectproperty);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("ClassProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_classproperty);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("Int8Property"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_int8property);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("Int16Property"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_int16property);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("IntProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_intproperty);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("Int64Property"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_int64property);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("ByteProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_byteproperty);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("UInt16Property"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_uint16property);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("UInt32Property"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_uint32property);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("UInt64Property"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_uint64property);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("StructProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_structproperty);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("UInt16Property"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_uint16property);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("UInt32Property"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_uint32property);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("UInt64Property"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_uint64property);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("StructProperty"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_structproperty);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("ArrayProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_arrayproperty);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("SetProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_setproperty);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("MapProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_mapproperty);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("FloatProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_floatproperty);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("DoubleProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_doubleproperty);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("DoubleProperty"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_doubleproperty);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("BoolProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_boolproperty);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("EnumProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_enumproperty);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("WeakObjectProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_weakobjectproperty);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("WeakObjectProperty"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_weakobjectproperty);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("NameProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_nameproperty);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("TextProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_textproperty);
         LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("StrProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_strproperty);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("SoftObjectProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_softobjectproperty);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("SoftClassProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_softobjectproperty);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("InterfaceProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_interfaceproperty);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("DelegateProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_delegateproperty);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("MulticastDelegateProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_multicastdelegateproperty);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("MulticastInlineDelegateProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_multicastdelegateproperty);
-        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("MulticastSparseDelegateProperty"), Unreal::FNAME_Find).GetComparisonIndex(), &LuaType::push_multicastsparsedelegateproperty);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("SoftObjectProperty"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_softobjectproperty);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("SoftClassProperty"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_softobjectproperty);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("InterfaceProperty"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_interfaceproperty);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("DelegateProperty"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_delegateproperty);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("MulticastDelegateProperty"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_multicastdelegateproperty);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("MulticastInlineDelegateProperty"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_multicastdelegateproperty);
+        LuaType::StaticState::m_property_value_pushers.emplace(FName(STR("MulticastSparseDelegateProperty"), Unreal::FNAME_Find).GetComparisonIndex(),
+                                                               &LuaType::push_multicastsparsedelegateproperty);
     }
 
     auto UE4SSProgram::setup_mods() -> void
@@ -1721,7 +1943,9 @@ namespace RC
     {
         if (!is_event_loop_thread())
         {
-            queue_event([this]() { queue_reinstall_mods(); });
+            queue_event([this]() {
+                queue_reinstall_mods();
+            });
             return;
         }
 
@@ -1770,7 +1994,9 @@ namespace RC
 
         if (!is_event_loop_thread())
         {
-            queue_event([this, mod]() { queue_reinstall_mod(mod); });
+            queue_event([this, mod]() {
+                queue_reinstall_mod(mod);
+            });
             return;
         }
 
@@ -1799,6 +2025,7 @@ namespace RC
         auto new_mod = std::make_unique<LuaMod>(*this, std::move(mod_name), std::move(mod_path));
         LuaMod* new_mod_ptr = new_mod.get();
         m_mods.emplace_back(std::move(new_mod));
+        new_mod_ptr->set_installed(true);
 
         new_mod_ptr->start_mod();
 
@@ -1814,7 +2041,9 @@ namespace RC
 
         if (!is_event_loop_thread())
         {
-            queue_event([this, mod]() { queue_uninstall_mod(mod); });
+            queue_event([this, mod]() {
+                queue_uninstall_mod(mod);
+            });
             return;
         }
 
@@ -1846,7 +2075,9 @@ namespace RC
 
         if (!is_event_loop_thread())
         {
-            queue_event([this, mod_id]() { queue_reinstall_mod(mod_id); });
+            queue_event([this, mod_id]() {
+                queue_reinstall_mod(mod_id);
+            });
             return;
         }
 
@@ -1870,7 +2101,9 @@ namespace RC
 
         if (!is_event_loop_thread())
         {
-            queue_event([this, mod_id]() { queue_uninstall_mod(mod_id); });
+            queue_event([this, mod_id]() {
+                queue_uninstall_mod(mod_id);
+            });
             return;
         }
 
@@ -1889,7 +2122,9 @@ namespace RC
     {
         if (!is_event_loop_thread())
         {
-            queue_event([this, mod_name]() { queue_reinstall_mod_by_name(mod_name); });
+            queue_event([this, mod_name]() {
+                queue_reinstall_mod_by_name(mod_name);
+            });
             return;
         }
 
@@ -1915,7 +2150,9 @@ namespace RC
     {
         if (!is_event_loop_thread())
         {
-            queue_event([this, mod_name]() { queue_uninstall_mod_by_name(mod_name); });
+            queue_event([this, mod_name]() {
+                queue_uninstall_mod_by_name(mod_name);
+            });
             return;
         }
 
@@ -1941,7 +2178,9 @@ namespace RC
     {
         if (!is_event_loop_thread())
         {
-            queue_event([this, mod_path]() { queue_start_lua_mod_by_path(mod_path); });
+            queue_event([this, mod_path]() {
+                queue_start_lua_mod_by_path(mod_path);
+            });
             return;
         }
 
@@ -2249,7 +2488,9 @@ namespace RC
 
     auto UE4SSProgram::queue_event(LegacyEventCallable callable, void* data) -> void
     {
-        queue_event([callable, data]() { callable(data); });
+        queue_event([callable, data]() {
+            callable(data);
+        });
     }
 
     auto UE4SSProgram::is_queue_empty() -> bool
@@ -2540,6 +2781,11 @@ namespace RC
 
     auto UE4SSProgram::static_cleanup() -> void
     {
+        if (s_program && s_program->m_mcp_server)
+        {
+            // DLL_PROCESS_DETACH holds the loader lock; never wait for the MCP thread here.
+            s_program->m_mcp_server->abandon_for_process_exit();
+        }
         delete &get_program();
 
         // Do cleanup of static objects here

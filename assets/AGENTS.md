@@ -9,6 +9,7 @@
 | 路径 | 职责 |
 | --- | --- |
 | `CustomGameConfigs/` | 特定游戏覆盖；发布为独立压缩包。 |
+| `CustomGameConfigs/NINJA GAIDEN 2 BLACK/` | NG2B UE 5.4 compatibility selector and overrides. |
 | `UE4SS_Signatures/` | 扫描脚本示例/覆盖。 |
 | `VTableLayoutTemplates/` | 各 UE 版本/CasePreserving VTable 模板，可由 UVTD 生成。 |
 | `MemberVarLayoutTemplates/` | 各 UE 版本成员布局模板，可由 UVTD 生成。 |

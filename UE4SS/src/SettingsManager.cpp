@@ -110,6 +110,13 @@ namespace RC
             General.DefaultFNameToStringMethod = Unreal::UnrealInitializer::FNameToStringMethod::Conv_NameToString;
         }
 
+        constexpr static File::CharType section_mcp[] = STR("MCP");
+        REGISTER_BOOL_SETTING(Mcp.Enabled, section_mcp, Enabled)
+        REGISTER_BOOL_SETTING(Mcp.DevelopmentMode, section_mcp, DevelopmentMode)
+        REGISTER_STRING_SETTING(Mcp.BindAddress, section_mcp, BindAddress)
+        REGISTER_INT64_SETTING(Mcp.Port, section_mcp, Port)
+        REGISTER_INT64_SETTING(Mcp.OperationTimeoutMs, section_mcp, OperationTimeoutMs)
+
         constexpr static File::CharType section_engine_version_override[] = STR("EngineVersionOverride");
         REGISTER_INT64_SETTING(EngineVersionOverride.MajorVersion, section_engine_version_override, MajorVersion)
         REGISTER_INT64_SETTING(EngineVersionOverride.MinorVersion, section_engine_version_override, MinorVersion)

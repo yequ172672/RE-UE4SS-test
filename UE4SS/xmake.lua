@@ -7,7 +7,7 @@ add_requires("ImGuiTextEdit v1.2.0", { debug = is_mode_debug(), configs = {runti
 add_requires("IconFontCppHeaders v1.0", { debug = is_mode_debug(), configs = {runtimes = get_mode_runtimes()}})
 add_requires("glfw 3.3.9", { debug = is_mode_debug() , configs = {runtimes = get_mode_runtimes()}})
 add_requires("opengl", { debug = is_mode_debug(), configs = {runtimes = get_mode_runtimes()} })
-add_requires("glaze v2.9.5", { debug = is_mode_debug(), configs = {runtimes = get_mode_runtimes()} })
+add_requires("glaze v6.4.0", { debug = is_mode_debug(), configs = {runtimes = get_mode_runtimes()} })
 add_requires("fmt 11.2.0", { debug = is_mode_debug(), configs = {runtimes = get_mode_runtimes()} })
 
 option("ue4ssBetaIsStarted")
@@ -81,7 +81,7 @@ target(projectName)
 
     add_packages("glaze", "polyhook_2", { public = true })
 
-    add_links("dbghelp", "psapi", "d3d11", { public = true })
+    add_links("dbghelp", "psapi", "d3d11", "ws2_32", { public = true })
 
     after_load(function (target)
         local projectRoot = get_config("ue4ssRoot")

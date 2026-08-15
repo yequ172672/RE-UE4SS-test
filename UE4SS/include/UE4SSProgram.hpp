@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -82,6 +83,11 @@ namespace RC
         CppUserModBase* mod{};
     };
 
+    namespace Mcp
+    {
+        class Server;
+    }
+
     class UE4SSProgram : public MProgram
     {
       public:
@@ -98,7 +104,7 @@ namespace RC
         static inline std::atomic_bool cpp_mods_done_loading{};
 
       public:
-        bool m_is_program_started;
+        bool m_is_program_started{};
 
       protected:
 #ifdef HAS_INPUT
@@ -111,12 +117,14 @@ namespace RC
 
       private:
         CrashDumper m_crash_dumper{};
+        std::unique_ptr<Mcp::Server> m_mcp_server{};
 
       private:
         std::filesystem::path m_game_path_and_exe_name;
         std::filesystem::path m_root_directory;
         std::filesystem::path m_module_file_path;
         std::filesystem::path m_working_directory;
+        std::filesystem::path m_game_config_directory;
         std::vector<std::filesystem::path> m_mods_directories;
         std::vector<std::filesystem::path> m_mods_directories_to_remove;
         std::filesystem::path m_game_executable_directory;
@@ -124,6 +132,7 @@ namespace RC
         std::filesystem::path m_object_dumper_output_directory;
         std::filesystem::path m_default_settings_path_and_file;
         std::filesystem::path m_settings_path_and_file;
+        std::filesystem::path m_settings_override_path;
         std::filesystem::path m_legacy_root_directory;
         Output::DebugConsoleDevice* m_debug_console_device{};
         Output::ConsoleDevice* m_console_device{};
@@ -163,7 +172,7 @@ namespace RC
         static inline UE4SSProgram* s_program{};
 
         bool m_has_game_specific_config{};
-        bool m_processing_events{};
+        std::atomic_bool m_processing_events{};
         bool m_pause_events_processing{};
         bool m_custom_member_variable_layout_loaded{};
 

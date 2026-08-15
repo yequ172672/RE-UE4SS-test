@@ -18,6 +18,7 @@
 | `buildscripts/build.ps1` | Windows configure/build 包装；可选生成器、编译器、模式和 target。 |
 | `buildscripts/build.sh` | Linux/交叉编译包装。 |
 | `buildscripts/release.py` | 版本提交、发布包、设置改写、资源归档和 release notes。 |
+| `mcp_smoke_test.py` | 对运行中的 UE4SS MCP 执行工具发现、日志读取、生命周期及传输失败场景验收。 |
 | `xmakescripts/build_configs.lua` | xmake 三段式 mode 定义。 |
 | `xmakescripts/rules/build_rules.lua` | mode 到编译定义/选项的映射。 |
 | `xmakescripts/modules/mods/install.lua` | Mod 安装辅助。 |
@@ -33,6 +34,7 @@
 - 脚本路径从脚本自身位置解析到项目根；不要依赖调用者当前目录。
 - build 目录名称必须包含足够的编译器/toolchain/mode 信息，避免不兼容 cache 混用。
 - 发布时的 Shipping 设置与 `assets/UE4SS-settings.ini` 开发默认值不同，改设置键时同步检查 `release.py` 的改写逻辑。
+- 发布打包用 `--build-dir` 选择唯一完整构建树；发现同名二进制歧义时必须失败，不能按目录遍历顺序静默选取。
 - CMake/xmake 模式、target 名称和产物名属于跨脚本接口；变更必须端到端搜索消费者。
 
 ## 验证

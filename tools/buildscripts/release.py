@@ -10,9 +10,10 @@ import sys
 import json
 
 class ReleaseHandler:
-    def __init__(self, is_dev_release, is_experimental, release_output='release'):
+    def __init__(self, is_dev_release, is_experimental, build_directory='.', release_output='release'):
         self.is_dev_release = is_dev_release
         self.is_experimental = is_experimental
+        self.build_directory = build_directory
         self.release_output = release_output
         self.staging_dir = os.path.join(self.release_output, 'StagingDev') if self.is_dev_release else os.path.join(self.release_output, 'StagingRelease')
         self.ue4ss_dir = os.path.join(self.staging_dir, 'ue4ss')
@@ -110,24 +111,41 @@ class ReleaseHandler:
             file.write(content)
 
     def scan_directories(self):
-        ue4ss_dll_path = ''
-        ue4ss_pdb_path = ''
-        dwmapi_dll_path = ''
-        cpp_mods_paths = {mod: '' for mod in self.cpp_mods if self.is_dev_release or self.cpp_mods[mod]['include_in_release']}
-        scan_start_dir = '.'
+        candidates = {
+            'ue4ss_dll': [],
+            'ue4ss_pdb': [],
+            'dwmapi_dll': [],
+        }
+        cpp_mod_candidates = {mod: [] for mod in self.cpp_mods if self.is_dev_release or self.cpp_mods[mod]['include_in_release']}
 
-        for root, _, files in os.walk(scan_start_dir):
+        for root, _, files in os.walk(self.build_directory):
             for file in files:
-                if file.lower() == "ue4ss.dll":
-                    ue4ss_dll_path = os.path.join(root, file)
-                if file.lower() == "ue4ss.pdb":
-                    ue4ss_pdb_path = os.path.join(root, file)
-                if file.lower() == "dwmapi.dll":
-                    dwmapi_dll_path = os.path.join(root, file)
-                for mod_name in cpp_mods_paths:
-                    if file.lower() == mod_name.lower() + '.dll':
-                        cpp_mods_paths[mod_name] = os.path.join(root, file)
+                path = os.path.join(root, file)
+                lower_name = file.lower()
+                if lower_name == 'ue4ss.dll':
+                    candidates['ue4ss_dll'].append(path)
+                elif lower_name == 'ue4ss.pdb':
+                    candidates['ue4ss_pdb'].append(path)
+                elif lower_name == 'dwmapi.dll':
+                    candidates['dwmapi_dll'].append(path)
 
+                for mod_name in cpp_mod_candidates:
+                    if lower_name == mod_name.lower() + '.dll':
+                        cpp_mod_candidates[mod_name].append(path)
+
+        def select_one(label, paths, required):
+            paths = sorted(os.path.normpath(path) for path in paths)
+            if len(paths) > 1:
+                choices = '\n  '.join(paths)
+                raise RuntimeError(f"Multiple {label} build artifacts found under '{self.build_directory}':\n  {choices}\nUse --build-dir to select one build tree.")
+            if not paths and required:
+                raise RuntimeError(f"{label} was not found under '{self.build_directory}'. Build the complete package targets or select another --build-dir.")
+            return paths[0] if paths else ''
+
+        ue4ss_dll_path = select_one('UE4SS.dll', candidates['ue4ss_dll'], True)
+        ue4ss_pdb_path = select_one('UE4SS.pdb', candidates['ue4ss_pdb'], self.is_dev_release)
+        dwmapi_dll_path = select_one('dwmapi.dll', candidates['dwmapi_dll'], True)
+        cpp_mods_paths = {mod: select_one(f'{mod}.dll', paths, False) for mod, paths in cpp_mod_candidates.items()}
         return ue4ss_dll_path, ue4ss_pdb_path, dwmapi_dll_path, cpp_mods_paths
 
     def copy_cpp_mods(self, cpp_mods_paths):
@@ -250,8 +268,10 @@ class Packager:
         os.mkdir(self.release_output)
 
     def run(self):
-        dev_handler = ReleaseHandler(is_dev_release=True, is_experimental=self.args.e, release_output=self.release_output)
-        release_handler = ReleaseHandler(is_dev_release=False, is_experimental=self.args.e, release_output=self.release_output)
+        dev_handler = ReleaseHandler(
+            is_dev_release=True, is_experimental=self.args.e, build_directory=self.args.build_dir, release_output=self.release_output)
+        release_handler = ReleaseHandler(
+            is_dev_release=False, is_experimental=self.args.e, build_directory=self.args.build_dir, release_output=self.release_output)
 
         dev_handler.make_staging_dirs()
         dev_handler.package_release()
@@ -325,6 +345,7 @@ if __name__ == "__main__":
 
     package_parser = subparsers.add_parser('package')
     package_parser.add_argument('-e', action='store_true')
+    package_parser.add_argument('--build-dir', default='.', help='Directory containing one complete set of build artifacts')
 
     release_commit_parser = subparsers.add_parser('release_commit')
     release_commit_parser.add_argument('username', nargs='?')
@@ -339,14 +360,15 @@ if __name__ == "__main__":
 """
 How to run this script:
 1. Running the 'package' command:
-    Usage: python release.py package
+    Usage: python release.py package [--build-dir BUILD_DIR]
 
-    --changelog_path : Optional argument to specify the path to the changelog file. Default is 'assets/Changelog.md'
-    -e : Argument used when running the script for experimental release
+    --changelog_path : Optional argument to specify the changelog file. Default is assets/Changelog.md
+    --build-dir : Directory containing one complete UE4SS build tree. Defaults to the repository root and rejects ambiguous artifacts.
+    -e : Argument used when running an experimental release.
 
     Examples:
-    - python release.py package 
-    - python release.py package -e --changelog_path custom/Changelog.md
+    - python release.py package --build-dir build
+    - python release.py package -e --build-dir build_cmake_Game__Dev__Win64
 
 2. Running the 'release_commit' command:
     Usage: python release.py release_commit [username]

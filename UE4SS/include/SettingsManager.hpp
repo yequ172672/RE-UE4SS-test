@@ -43,6 +43,14 @@ namespace RC
             GameThreadExecutionMethod DefaultExecuteInGameThreadMethod{GameThreadExecutionMethod::EngineTick};
             Unreal::UnrealInitializer::FNameToStringMethod DefaultFNameToStringMethod{Unreal::UnrealInitializer::FNameToStringMethod::Scan};
         } General;
+        struct SectionMcp
+        {
+            bool Enabled{false};
+            bool DevelopmentMode{false};
+            StringType BindAddress{STR("127.0.0.1")};
+            int64_t Port{8182};
+            int64_t OperationTimeoutMs{5000};
+        } Mcp;
 
         struct SectionEngineVersionOverride
         {

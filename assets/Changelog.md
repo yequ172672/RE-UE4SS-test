@@ -7,6 +7,10 @@ TBD
 ## New
 
 ### General
+Added a local, opt-in MCP Streamable HTTP endpoint for AI-assisted UE4SS development. It provides evidence-based session and capability discovery, paginated logs, mod state, game-thread UObject discovery, Lua evaluation, and Lua mod reload with structured operation/error states.
+
+Added automatic game-specific compatibility configuration selection from `CustomGameConfigs`. Configurations can declare executable, Unreal project, and install-directory selectors in `GameConfig.ini`; `UE4SS-compatibility.ini` overlays only game-specific settings without replacing local MCP, GUI, hotkey, or mod settings.
+
 
 Added CMake build system alongside Xmake - ([UE4SS #1067](https://github.com/UE4SS-RE/RE-UE4SS/pull/1067))
 - CMake >= 3.22 is now supported as the default build system
