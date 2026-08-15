@@ -10,6 +10,7 @@
 | --- | --- |
 | `buildscripts/` | Windows/Linux CMake 包装、版本更新与发布打包。 |
 | `xmakescripts/` | xmake mode、rules、依赖构建和 CI 查询插件。 |
+| `mcp_host/` | 外部 MCP 主机的传输、受限工作区、任务、构建、调试和场景执行模块。 |
 
 ## 关键文件
 
@@ -19,6 +20,8 @@
 | `buildscripts/build.sh` | Linux/交叉编译包装。 |
 | `buildscripts/release.py` | 版本提交、发布包、设置改写、资源归档和 release notes。 |
 | `mcp_smoke_test.py` | 对运行中的 UE4SS MCP 执行工具发现、日志读取、生命周期及传输失败场景验收。 |
+| `ue4ss_mcp_host.py` / `ue4ss_mcp_host.example.json` | 启动 loopback MCP 主机并配置显式工作区、运行时端点和工具链。 |
+| `test_mcp_host.py` | 外部主机传输、文件、模组、DAP 和场景回归测试。 |
 | `xmakescripts/build_configs.lua` | xmake 三段式 mode 定义。 |
 | `xmakescripts/rules/build_rules.lua` | mode 到编译定义/选项的映射。 |
 | `xmakescripts/modules/mods/install.lua` | Mod 安装辅助。 |
@@ -28,6 +31,7 @@
 - 构建脚本调用根 CMake 配置和 `cmake/toolchains/`。
 - 发布脚本读取 `assets/`、构建产物及 Git 历史，并写入 `release/` 或版本元数据。
 - xmake 脚本同时被仓库自身与把 UE4SS 作为子项目的下游工程消费，不能假设 `os.projectdir()` 总是仓库根。
+- MCP 主机只访问配置中的命名根目录，并可选代理游戏内 MCP；CMake、Unreal Editor、UnrealPak 与 DAP 适配器均为显式工具链依赖。
 
 ## Common Patterns
 
@@ -36,6 +40,7 @@
 - 发布时的 Shipping 设置与 `assets/UE4SS-settings.ini` 开发默认值不同，改设置键时同步检查 `release.py` 的改写逻辑。
 - 发布打包用 `--build-dir` 选择唯一完整构建树；发现同名二进制歧义时必须失败，不能按目录遍历顺序静默选取。
 - CMake/xmake 模式、target 名称和产物名属于跨脚本接口；变更必须端到端搜索消费者。
+- MCP 文件与模组操作返回哈希和实际变化；写入/删除使用期望哈希或清单检测并发漂移，长任务通过可取消任务与游标事件暴露进度。
 
 ## 验证
 

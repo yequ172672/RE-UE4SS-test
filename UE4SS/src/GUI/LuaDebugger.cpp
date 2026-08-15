@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cctype>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -46,10 +47,8 @@ namespace RC::GUI
         try
         {
             // For UObject-derived types, get the full name
-            if (metatable_name == "UObject" || metatable_name == "AActor" ||
-                metatable_name == "UClass" || metatable_name == "UStruct" ||
-                metatable_name == "UScriptStruct" || metatable_name == "UFunction" ||
-                metatable_name == "UEnum" || metatable_name == "UWorld" ||
+            if (metatable_name == "UObject" || metatable_name == "AActor" || metatable_name == "UClass" || metatable_name == "UStruct" ||
+                metatable_name == "UScriptStruct" || metatable_name == "UFunction" || metatable_name == "UEnum" || metatable_name == "UWorld" ||
                 metatable_name == "UInterface")
             {
                 auto& lua_object = *static_cast<LuaType::UObject*>(lua_touserdata(L, index));
@@ -127,10 +126,8 @@ namespace RC::GUI
     {
         try
         {
-            if (metatable_name == "UObject" || metatable_name == "AActor" ||
-                metatable_name == "UClass" || metatable_name == "UStruct" ||
-                metatable_name == "UScriptStruct" || metatable_name == "UFunction" ||
-                metatable_name == "UEnum" || metatable_name == "UWorld" ||
+            if (metatable_name == "UObject" || metatable_name == "AActor" || metatable_name == "UClass" || metatable_name == "UStruct" ||
+                metatable_name == "UScriptStruct" || metatable_name == "UFunction" || metatable_name == "UEnum" || metatable_name == "UWorld" ||
                 metatable_name == "UInterface")
             {
                 auto& lua_object = *static_cast<LuaType::UObject*>(lua_touserdata(L, index));
@@ -161,6 +158,7 @@ namespace RC::GUI
 
     LuaDebugger::~LuaDebugger()
     {
+        continue_execution();
         LuaMadeSimple::unregister_error_callback(lua_error_callback);
 
         if (s_instance == this)
@@ -182,17 +180,16 @@ namespace RC::GUI
 
     auto LuaDebugger::register_lua_state(lua_State* L, const std::string& mod_name, const std::string& state_type) -> void
     {
-        std::lock_guard<std::mutex> lock(m_states_mutex);
+        {
+            std::lock_guard<std::mutex> lock(m_states_mutex);
+            LuaStateInfo info;
+            info.lua_state = L;
+            info.mod_name = mod_name;
+            info.state_type = state_type;
+            info.is_active = true;
+            m_lua_states[L] = std::move(info);
+        }
 
-        LuaStateInfo info;
-        info.lua_state = L;
-        info.mod_name = mod_name;
-        info.state_type = state_type;
-        info.is_active = true;
-
-        m_lua_states[L] = std::move(info);
-
-        // Auto-restore debug hook if this mod had debug enabled before reload
         if (m_debug_enabled_mods.count(mod_name) > 0)
         {
             install_debug_hook(L);
@@ -201,6 +198,15 @@ namespace RC::GUI
 
     auto LuaDebugger::unregister_lua_state(lua_State* L) -> void
     {
+        if (m_paused_state.load() == L)
+        {
+            continue_execution();
+            std::unique_lock<std::mutex> pause_lock(m_pause_mutex);
+            m_pause_cv.wait(pause_lock, [this, L] {
+                return !m_is_paused.load() || m_paused_state.load() != L;
+            });
+        }
+        uninstall_debug_hook(L);
         std::lock_guard<std::mutex> lock(m_states_mutex);
         m_lua_states.erase(L);
     }
@@ -242,20 +248,27 @@ namespace RC::GUI
 
         if (m_pause_on_error && has_debug_hook(L))
         {
-            m_paused_state = L;
-            m_paused_line = 0;
-            m_paused_source = "";
-
-            if (!record.call_stack.empty())
             {
-                m_paused_line = record.call_stack[0].current_line;
-                m_paused_source = record.call_stack[0].source;
+                std::lock_guard<std::mutex> lock(m_paused_data_mutex);
+                m_paused_state = L;
+                m_paused_line = 0;
+                m_paused_source.clear();
+                if (!record.call_stack.empty())
+                {
+                    m_paused_line = record.call_stack[0].current_line;
+                    m_paused_source = record.call_stack[0].source;
+                }
+                ++m_pause_generation;
             }
 
+            m_continue_requested.store(false);
             m_is_paused.store(true);
             wait_for_continue();
             m_is_paused.store(false);
-            m_paused_state = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(m_paused_data_mutex);
+                m_paused_state = nullptr;
+            }
             m_continue_requested.store(false);
         }
     }
@@ -271,6 +284,11 @@ namespace RC::GUI
     {
         std::lock_guard<std::mutex> lock(m_errors_mutex);
         return m_error_history.size();
+    }
+    auto LuaDebugger::get_error_history() const -> std::vector<LuaErrorRecord>
+    {
+        std::lock_guard<std::mutex> lock(m_errors_mutex);
+        return {m_error_history.begin(), m_error_history.end()};
     }
 
     auto LuaDebugger::get_stack_slots(lua_State* L) -> std::vector<LuaStackSlot>
@@ -673,9 +691,9 @@ namespace RC::GUI
                 }
                 lua_pop(L, 2); // pop name and metatable
             }
-            
+
             std::string rich_info = get_ue4ss_userdata_info(L, index, metatable_name);
-            
+
             std::ostringstream oss;
             if (!metatable_name.empty())
             {
@@ -880,11 +898,9 @@ namespace RC::GUI
             lua_settop(L, original_top);
         }
 
-        std::sort(globals.begin(),
-                  globals.end(),
-                  [](const auto& a, const auto& b) {
-                      return a.first < b.first;
-                  });
+        std::sort(globals.begin(), globals.end(), [](const auto& a, const auto& b) {
+            return a.first < b.first;
+        });
 
         return globals;
     }
@@ -1007,11 +1023,9 @@ namespace RC::GUI
             lua_settop(L, original_top);
         }
 
-        std::sort(children.begin(),
-                  children.end(),
-                  [](const auto& a, const auto& b) {
-                      return a.key < b.key;
-                  });
+        std::sort(children.begin(), children.end(), [](const auto& a, const auto& b) {
+            return a.key < b.key;
+        });
 
         return children;
     }
@@ -1062,13 +1076,12 @@ namespace RC::GUI
     {
         std::lock_guard<std::mutex> lock(m_breakpoints_mutex);
 
-        m_breakpoints.erase(
-                std::remove_if(m_breakpoints.begin(),
-                               m_breakpoints.end(),
-                               [&](const LuaBreakpoint& bp) {
-                                   return bp.source_file == source && bp.line == line;
-                               }),
-                m_breakpoints.end());
+        m_breakpoints.erase(std::remove_if(m_breakpoints.begin(),
+                                           m_breakpoints.end(),
+                                           [&](const LuaBreakpoint& bp) {
+                                               return bp.source_file == source && bp.line == line;
+                                           }),
+                            m_breakpoints.end());
     }
 
     auto LuaDebugger::toggle_breakpoint(const std::string& source, int line) -> void
@@ -1109,6 +1122,47 @@ namespace RC::GUI
             }
         }
         return false;
+    }
+    auto LuaDebugger::get_breakpoints() const -> std::vector<LuaBreakpoint>
+    {
+        std::lock_guard<std::mutex> lock(m_breakpoints_mutex);
+        return m_breakpoints;
+    }
+
+    auto LuaDebugger::get_paused_snapshot() const -> LuaDebugSnapshot
+    {
+        LuaDebugSnapshot snapshot;
+        snapshot.paused = m_is_paused.load();
+        if (!snapshot.paused)
+        {
+            return snapshot;
+        }
+
+        lua_State* paused_state{};
+        {
+            std::lock_guard<std::mutex> lock(m_paused_data_mutex);
+            snapshot.paused = m_is_paused.load();
+            if (!snapshot.paused)
+            {
+                return snapshot;
+            }
+            paused_state = m_paused_state.load();
+            snapshot.generation = m_pause_generation;
+            snapshot.source = m_paused_source;
+            snapshot.line = m_paused_line;
+            snapshot.stack_slots = m_paused_stack_slots;
+            snapshot.call_stack = m_paused_call_stack;
+            snapshot.stack_frames = m_paused_stack_frames;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_states_mutex);
+            if (const auto state = m_lua_states.find(paused_state); state != m_lua_states.end())
+            {
+                snapshot.mod_name = state->second.mod_name;
+                snapshot.state_type = state->second.state_type;
+            }
+        }
+        return snapshot;
     }
 
     auto LuaDebugger::continue_execution() -> void
@@ -1170,20 +1224,69 @@ namespace RC::GUI
         {
             source = source.substr(1);
         }
+        const auto normalize_source = [](std::string value) {
+            std::ranges::transform(value, value.begin(), [](unsigned char character) {
+                return character == '\\' ? '/' : static_cast<char>(std::tolower(character));
+            });
+            return value;
+        };
+        const auto normalized_source = normalize_source(source);
 
         std::lock_guard<std::mutex> lock(m_breakpoints_mutex);
-
         for (auto& bp : m_breakpoints)
         {
-            if (bp.enabled && ar->currentline == bp.line)
+            const auto normalized_breakpoint_source = normalize_source(bp.source_file);
+            if (!bp.enabled || ar->currentline != bp.line ||
+                (normalized_source.find(normalized_breakpoint_source) == std::string::npos &&
+                 normalized_breakpoint_source.find(normalized_source) == std::string::npos))
             {
-                // Check if source matches (partial match for paths)
-                if (source.find(bp.source_file) != std::string::npos ||
-                    bp.source_file.find(source) != std::string::npos)
+                continue;
+            }
+
+            bool condition_matches = true;
+            if (!bp.condition.empty())
+            {
+                const int stack_top = lua_gettop(L);
+                lua_newtable(L);
+                const int environment_index = lua_gettop(L);
+
+                for (int index = 1;; ++index)
                 {
-                    ++bp.hit_count;
-                    return true;
+                    const char* local_name = lua_getlocal(L, ar, index);
+                    if (!local_name)
+                    {
+                        break;
+                    }
+                    if (local_name[0] != '(')
+                    {
+                        lua_setfield(L, environment_index, local_name);
+                    }
+                    else
+                    {
+                        lua_pop(L, 1);
+                    }
                 }
+
+                lua_newtable(L);
+                lua_pushglobaltable(L);
+                lua_setfield(L, -2, "__index");
+                lua_setmetatable(L, environment_index);
+
+                const std::string expression = "return (" + bp.condition + ")";
+                condition_matches = luaL_loadbufferx(L, expression.data(), expression.size(), "=breakpoint condition", "t") == LUA_OK;
+                if (condition_matches)
+                {
+                    lua_pushvalue(L, environment_index);
+                    lua_setupvalue(L, -2, 1);
+                    condition_matches = lua_pcall(L, 0, 1, 0) == LUA_OK && lua_toboolean(L, -1) != 0;
+                }
+                lua_settop(L, stack_top);
+            }
+
+            if (condition_matches)
+            {
+                ++bp.hit_count;
+                return true;
             }
         }
         return false;
@@ -1192,13 +1295,9 @@ namespace RC::GUI
     auto LuaDebugger::wait_for_continue() -> void
     {
         std::unique_lock<std::mutex> lock(m_pause_mutex);
-        m_pause_cv.wait(lock,
-                        [this]() {
-                            return m_continue_requested.load() ||
-                                   m_step_requested.load() ||
-                                   m_step_over_requested.load() ||
-                                   m_step_out_requested.load();
-                        });
+        m_pause_cv.wait(lock, [this]() {
+            return m_continue_requested.load() || m_step_requested.load() || m_step_over_requested.load() || m_step_out_requested.load();
+        });
     }
 
     auto LuaDebugger::debug_hook(lua_State* L, lua_Debug* ar) -> void
@@ -1222,7 +1321,7 @@ namespace RC::GUI
             {
                 should_break = true;
             }
-            
+
             if (debugger.m_step_requested.load())
             {
                 should_break = true;
@@ -1252,31 +1351,32 @@ namespace RC::GUI
 
         if (should_break)
         {
-            debugger.m_paused_state = L;
-            debugger.m_paused_line = ar->currentline;
-            debugger.m_paused_source = ar->source ? ar->source : "";
             debugger.m_step_start_depth = debugger.get_call_depth(L);
             debugger.m_script_scroll_to_line = ar->currentline;
 
             {
                 std::lock_guard<std::mutex> lock(debugger.m_paused_data_mutex);
+                debugger.m_paused_state = L;
+                debugger.m_paused_line = ar->currentline;
+                debugger.m_paused_source = ar->source ? ar->source : "";
                 debugger.m_paused_stack_slots = debugger.get_stack_slots(L);
                 debugger.m_paused_call_stack = debugger.get_call_stack(L);
                 debugger.m_paused_stack_frames = debugger.get_stack_frames_with_locals(L);
+                ++debugger.m_pause_generation;
             }
 
-            debugger.m_is_paused.store(true);
             debugger.m_continue_requested.store(false);
+            debugger.m_is_paused.store(true);
             debugger.wait_for_continue();
             debugger.m_is_paused.store(false);
-            debugger.m_paused_state = nullptr;
-
             {
                 std::lock_guard<std::mutex> lock(debugger.m_paused_data_mutex);
+                debugger.m_paused_state = nullptr;
                 debugger.m_paused_stack_slots.clear();
                 debugger.m_paused_call_stack.clear();
                 debugger.m_paused_stack_frames.clear();
             }
+            debugger.m_pause_cv.notify_all();
         }
     }
 
@@ -1284,6 +1384,7 @@ namespace RC::GUI
     {
         if (!L) return;
         lua_sethook(L, debug_hook, LUA_MASKLINE | LUA_MASKCALL | LUA_MASKRET, 0);
+        std::lock_guard<std::mutex> lock(m_hooks_mutex);
         m_states_with_hooks.insert(L);
     }
 
@@ -1291,11 +1392,13 @@ namespace RC::GUI
     {
         if (!L) return;
         lua_sethook(L, nullptr, 0, 0);
+        std::lock_guard<std::mutex> lock(m_hooks_mutex);
         m_states_with_hooks.erase(L);
     }
 
     auto LuaDebugger::has_debug_hook(lua_State* L) const -> bool
     {
+        std::lock_guard<std::mutex> lock(m_hooks_mutex);
         return m_states_with_hooks.count(L) > 0;
     }
 
@@ -1382,12 +1485,9 @@ namespace RC::GUI
             if (lua_mod)
             {
                 bool is_this_mod = false;
-                if (lua_mod->m_main_lua && lua_mod->m_main_lua->get_lua_state() == L)
-                    is_this_mod = true;
-                if (lua_mod->m_hook_lua && lua_mod->m_hook_lua->get_lua_state() == L)
-                    is_this_mod = true;
-                if (lua_mod->m_async_lua && lua_mod->m_async_lua->get_lua_state() == L)
-                    is_this_mod = true;
+                if (lua_mod->m_main_lua && lua_mod->m_main_lua->get_lua_state() == L) is_this_mod = true;
+                if (lua_mod->m_hook_lua && lua_mod->m_hook_lua->get_lua_state() == L) is_this_mod = true;
+                if (lua_mod->m_async_lua && lua_mod->m_async_lua->get_lua_state() == L) is_this_mod = true;
 
                 if (is_this_mod)
                 {
@@ -1484,12 +1584,9 @@ namespace RC::GUI
             if (lua_mod)
             {
                 bool is_this_mod = false;
-                if (lua_mod->m_main_lua && lua_mod->m_main_lua->get_lua_state() == L)
-                    is_this_mod = true;
-                if (lua_mod->m_hook_lua && lua_mod->m_hook_lua->get_lua_state() == L)
-                    is_this_mod = true;
-                if (lua_mod->m_async_lua && lua_mod->m_async_lua->get_lua_state() == L)
-                    is_this_mod = true;
+                if (lua_mod->m_main_lua && lua_mod->m_main_lua->get_lua_state() == L) is_this_mod = true;
+                if (lua_mod->m_hook_lua && lua_mod->m_hook_lua->get_lua_state() == L) is_this_mod = true;
+                if (lua_mod->m_async_lua && lua_mod->m_async_lua->get_lua_state() == L) is_this_mod = true;
 
                 if (is_this_mod)
                 {
@@ -1545,8 +1642,7 @@ namespace RC::GUI
                         std::ostringstream oss;
                         for (int i = 1; i <= num_results; ++i)
                         {
-                            if (i > 1)
-                                oss << ", ";
+                            if (i > 1) oss << ", ";
                             oss << format_stack_value(L, original_top + i, 256);
                         }
                         result = oss.str();
@@ -1641,7 +1737,7 @@ namespace RC::GUI
         }
 
         ImGui::Separator();
-        
+
         float panel_height = ImGui::GetContentRegionAvail().y - scaled(31.0f) - scaled(8.0f);
 
         // Split layout: left side for state list, right side for details
@@ -2342,8 +2438,7 @@ namespace RC::GUI
         {
             for (const auto& [name, slot] : globals)
             {
-                if (name.find(m_globals_filter) != std::string::npos ||
-                    slot.type_name.find(m_globals_filter) != std::string::npos)
+                if (name.find(m_globals_filter) != std::string::npos || slot.type_name.find(m_globals_filter) != std::string::npos)
                 {
                     filtered_globals.emplace_back(name, slot);
                 }
@@ -2510,9 +2605,7 @@ namespace RC::GUI
         ImGui::EndChild();
     }
 
-    auto LuaDebugger::render_globals_tree_node(const std::vector<std::pair<std::string, LuaStackSlot>>& children,
-                                               const std::string& parent_path,
-                                               int depth) -> void
+    auto LuaDebugger::render_globals_tree_node(const std::vector<std::pair<std::string, LuaStackSlot>>& children, const std::string& parent_path, int depth) -> void
     {
         if (depth > static_cast<int>(MAX_TABLE_DEPTH))
         {
@@ -2975,10 +3068,8 @@ namespace RC::GUI
         if (!m_paused_source.empty())
         {
             std::string src = m_paused_source;
-            if (!src.empty() && src[0] == '@')
-                src = src.substr(1);
-            if (src.length() > 50)
-                src = "..." + src.substr(src.length() - 47);
+            if (!src.empty() && src[0] == '@') src = src.substr(1);
+            if (src.length() > 50) src = "..." + src.substr(src.length() - 47);
             pause_info += " in " + src;
         }
         ImGui::Text("%s", pause_info.c_str());
@@ -3113,8 +3204,7 @@ namespace RC::GUI
             if (!current_display.empty())
             {
                 size_t last_slash = current_display.find_last_of("\\/");
-                if (last_slash != std::string::npos)
-                    current_display = current_display.substr(last_slash + 1);
+                if (last_slash != std::string::npos) current_display = current_display.substr(last_slash + 1);
             }
 
             ImGui::SetNextItemWidth(scaled(200.0f));
@@ -3124,8 +3214,7 @@ namespace RC::GUI
                 {
                     std::string name = path;
                     size_t pos = name.find_last_of("\\/");
-                    if (pos != std::string::npos)
-                        name = name.substr(pos + 1);
+                    if (pos != std::string::npos) name = name.substr(pos + 1);
 
                     if (ImGui::Selectable(name.c_str(), m_current_script_path == path))
                     {
@@ -3268,8 +3357,7 @@ namespace RC::GUI
         if (!current_display.empty())
         {
             size_t last_slash = current_display.find_last_of("\\/");
-            if (last_slash != std::string::npos)
-                current_display = current_display.substr(last_slash + 1);
+            if (last_slash != std::string::npos) current_display = current_display.substr(last_slash + 1);
         }
 
         // If no state selected but we have a loaded file, scan for other scripts in the same mod folder
@@ -3297,8 +3385,7 @@ namespace RC::GUI
             {
                 std::string name = path;
                 size_t pos = name.find_last_of("\\/");
-                if (pos != std::string::npos)
-                    name = name.substr(pos + 1);
+                if (pos != std::string::npos) name = name.substr(pos + 1);
 
                 if (ImGui::Selectable(name.c_str(), m_script_edit_path == path))
                 {
@@ -3677,11 +3764,9 @@ namespace RC::GUI
             }
         }
 
-        std::sort(m_discovered_mods.begin(),
-                  m_discovered_mods.end(),
-                  [](const auto& a, const auto& b) {
-                      return a.name < b.name;
-                  });
+        std::sort(m_discovered_mods.begin(), m_discovered_mods.end(), [](const auto& a, const auto& b) {
+            return a.name < b.name;
+        });
 
         m_mods_list_dirty = false;
     }
@@ -3875,7 +3960,8 @@ namespace RC::GUI
                         while (pos < main_content.size())
                         {
                             // Skip whitespace
-                            while (pos < main_content.size() && (main_content[pos] == ' ' || main_content[pos] == '\t' || main_content[pos] == '\n' || main_content[pos] == '\r'))
+                            while (pos < main_content.size() &&
+                                   (main_content[pos] == ' ' || main_content[pos] == '\t' || main_content[pos] == '\n' || main_content[pos] == '\r'))
                                 pos++;
 
                             if (pos < main_content.size() && main_content[pos] == '-' && pos + 1 < main_content.size() && main_content[pos + 1] == '-')

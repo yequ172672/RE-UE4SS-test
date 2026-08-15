@@ -31,6 +31,7 @@
 #include <Mod/LuaMod.hpp>
 #pragma warning(disable : 4005)
 #include <GUI/Dumpers.hpp>
+#include <GUI/LuaDebugger.hpp>
 #include <UE4SSProgram.hpp>
 #include <USMapGenerator/Generator.hpp>
 #include <Unreal/Core/HAL/Platform.hpp>
@@ -119,8 +120,8 @@ namespace RC
                                     int cb_ref,
                                     int post_cb_ref,
                                     int thread_ref)
-            : pre_callback_id(pre_id), post_callback_id(post_id), unreal_function(func), mod(m), lua(l),
-              lua_callback_ref(cb_ref), lua_post_callback_ref(post_cb_ref), lua_thread_ref(thread_ref)
+            : pre_callback_id(pre_id), post_callback_id(post_id), unreal_function(func), mod(m), lua(l), lua_callback_ref(cb_ref),
+              lua_post_callback_ref(post_cb_ref), lua_thread_ref(thread_ref)
         {
         }
     };
@@ -749,18 +750,9 @@ namespace RC
         property_type_table.make_local();
     }
 
-    // Private helper: Ensures hook thread exists and returns the registry reference (or LUA_REFNIL if already exists)
     static int ensure_hook_thread_exists(LuaMod* mod)
     {
-        if (mod->m_hook_lua == nullptr)
-        {
-            // First use - create new thread and anchor it in the registry
-            mod->m_hook_lua = &mod->lua().new_thread();
-            int thread_ref = luaL_ref(mod->lua().get_lua_state(), LUA_REGISTRYINDEX);
-            return thread_ref;
-        }
-
-        // Thread already exists and is already anchored
+        mod->ensure_hook_lua();
         return LUA_REFNIL;
     }
 
@@ -890,11 +882,11 @@ namespace RC
     auto LuaMod::setup_custom_module_loader(const LuaMadeSimple::Lua* lua_state) -> void
     {
         lua_State* L = lua_state->get_lua_state();
-    
+
         // Initialize ue4ss_loaded_modules table
         lua_newtable(L);
         lua_setglobal(L, "ue4ss_loaded_modules");
-    
+
         // Get package.searchers table
         lua_getglobal(L, "package");
         if (!lua_istable(L, -1))
@@ -903,7 +895,7 @@ namespace RC
             lua_pop(L, 1);
             return;
         }
-    
+
         lua_getfield(L, -1, "searchers");
         if (!lua_istable(L, -1))
         {
@@ -911,7 +903,7 @@ namespace RC
             lua_pop(L, 2);
             return;
         }
-    
+
         // Insert our searcher at position 1
         // First, shift existing searchers up
         lua_Integer len = luaL_len(L, -1);
@@ -920,16 +912,16 @@ namespace RC
             lua_geti(L, -1, i);     // Get searchers[i]
             lua_seti(L, -2, i + 1); // Set searchers[i+1] = searchers[i]
         }
-    
+
         // Push the LuaMod instance as a light userdata (our upvalue)
         lua_pushlightuserdata(L, this);
-    
+
         // Create the C closure with one upvalue
         lua_pushcclosure(L, custom_module_searcher, 1);
-    
+
         // Set searchers[1] = our new closure
         lua_seti(L, -2, 1);
-    
+
         lua_pop(L, 2); // Clean up stack: searchers, package
     }
 
@@ -942,7 +934,7 @@ namespace RC
             lua_pushstring(L, "module name is required");
             return 1;
         }
-        
+
         // Get the LuaMod* from the upvalue at index 1
         auto* lua_mod = static_cast<LuaMod*>(lua_touserdata(L, lua_upvalueindex(1)));
         if (!lua_mod)
@@ -950,23 +942,21 @@ namespace RC
             lua_pushstring(L, "custom searcher is missing its C++ context");
             return 1;
         }
-        
+
         // Get paths directly from the C++ object and convert to UTF-8 strings for Lua
         const auto& mods_dir = lua_mod->get_program().get_mods_directory();
         const auto& mod_name = lua_mod->get_name();
         const auto& scripts_path = lua_mod->get_scripts_path();
-        
+
         std::string mods_path_str = normalize_path_for_lua(mods_dir);
         std::string mod_name_str = to_utf8_string(mod_name);
         std::string scripts_path_str = normalize_path_for_lua(scripts_path);
-        
+
         // Try different path combinations
-        std::vector<std::string> paths_to_try = {
-            scripts_path_str + "/" + module_name + ".lua",
-            mods_path_str + "/shared/" + module_name + ".lua",
-            mods_path_str + "/shared/" + module_name + "/" + module_name + ".lua"
-        };
-        
+        std::vector<std::string> paths_to_try = {scripts_path_str + "/" + module_name + ".lua",
+                                                 mods_path_str + "/shared/" + module_name + ".lua",
+                                                 mods_path_str + "/shared/" + module_name + "/" + module_name + ".lua"};
+
         // Try each path
         std::string attempted_paths_str;
         for (const auto& path : paths_to_try)
@@ -982,27 +972,27 @@ namespace RC
                 attempted_paths_str += "\n\t" + path + " (encoding error)";
                 continue;
             }
-            
+
             if (!std::filesystem::exists(wide_path))
             {
                 attempted_paths_str += "\n\t" + path;
                 continue;
             }
-            
+
             // Check if already loaded
             lua_getglobal(L, "ue4ss_loaded_modules");
             lua_pushstring(L, path.c_str());
             lua_gettable(L, -2);
-            
+
             if (!lua_isnil(L, -1))
             {
                 // Already loaded, return the cached function
                 lua_remove(L, -2); // Remove ue4ss_loaded_modules table
                 return 1;
             }
-            
+
             lua_pop(L, 2); // Pop nil and ue4ss_loaded_modules
-            
+
             // Try to load the file
             std::ifstream file(wide_path, std::ios::binary);
             if (!file.is_open())
@@ -1010,12 +1000,12 @@ namespace RC
                 attempted_paths_str += "\n\t" + path + " (cannot open)";
                 continue;
             }
-            
+
             // Get file size and read content
             file.seekg(0, std::ios::end);
             std::streamsize size = file.tellg();
             file.seekg(0, std::ios::beg);
-            
+
             std::vector<char> buffer(size);
             if (!file.read(buffer.data(), size))
             {
@@ -1023,20 +1013,20 @@ namespace RC
                 continue;
             }
             file.close();
-            
+
             // Create chunk name for debugging
             std::string chunk_name = "@" + path;
-            
+
             // Load the script as a function that returns the module
             std::string module_wrapper = "return function()\n" + std::string(buffer.data(), buffer.size()) + "\nend";
-            
+
             if (luaL_loadbuffer(L, module_wrapper.c_str(), module_wrapper.size(), chunk_name.c_str()) != LUA_OK)
             {
                 attempted_paths_str += "\n\t" + path + " (syntax error: " + lua_tostring(L, -1) + ")";
                 lua_pop(L, 1); // Pop error message
                 continue;
             }
-            
+
             // Execute to get the loader function
             if (lua_pcall(L, 0, 1, 0) != LUA_OK)
             {
@@ -1044,18 +1034,18 @@ namespace RC
                 lua_pop(L, 1); // Pop error message
                 continue;
             }
-            
+
             // Cache the loaded module
             lua_getglobal(L, "ue4ss_loaded_modules");
             lua_pushstring(L, path.c_str());
             lua_pushvalue(L, -3); // Copy the function
             lua_settable(L, -3);
             lua_pop(L, 1); // Pop ue4ss_loaded_modules
-            
+
             // Return the loader function
             return 1;
         }
-        
+
         // Module not found
         std::string error_msg = "module '" + std::string(module_name) + "' not found:" + attempted_paths_str;
         lua_pushstring(L, error_msg.c_str());
@@ -1545,7 +1535,8 @@ Overloads:
                             [&lua, lua_callback_registry_index, &lua_keybind_callback_lambda]() {
                                 lua_keybind_callback_lambda(lua, lua_callback_registry_index);
                             },
-                            1, mod);
+                            1,
+                            mod);
                 }
                 else if (lua.is_table())
                 {
@@ -1590,7 +1581,8 @@ Overloads:
                                 [&lua, lua_callback_registry_index, &lua_keybind_callback_lambda]() {
                                     lua_keybind_callback_lambda(lua, lua_callback_registry_index);
                                 },
-                                1, mod);
+                                1,
+                                mod);
                     }
                     else
                     {
@@ -1599,7 +1591,8 @@ Overloads:
                                 [&lua, lua_callback_registry_index, &lua_keybind_callback_lambda]() {
                                     lua_keybind_callback_lambda(lua, lua_callback_registry_index);
                                 },
-                                1, mod);
+                                1,
+                                mod);
                     }
                 }
                 else
@@ -1664,7 +1657,8 @@ Overloads:
                             [&lua, lua_callback_registry_index, &lua_keybind_callback_lambda]() {
                                 lua_keybind_callback_lambda(lua, lua_callback_registry_index);
                             },
-                            1, mod);
+                            1,
+                            mod);
                 }
                 else if (lua.is_table())
                 {
@@ -1707,7 +1701,8 @@ Overloads:
                                 [&lua, lua_callback_registry_index, &lua_keybind_callback_lambda]() {
                                     lua_keybind_callback_lambda(lua, lua_callback_registry_index);
                                 },
-                                1, mod);
+                                1,
+                                mod);
                     }
                     else
                     {
@@ -1716,7 +1711,8 @@ Overloads:
                                 [&lua, lua_callback_registry_index, &lua_keybind_callback_lambda]() {
                                     lua_keybind_callback_lambda(lua, lua_callback_registry_index);
                                 },
-                                1, mod);
+                                1,
+                                mod);
                     }
                 }
                 else
@@ -1775,7 +1771,6 @@ Overloads:
                                                 "large (>int32)\n>FunctionName: {}",
                                                 to_string(function_name_no_prefix)));
                 }
-
 
                 auto func_ptr = unreal_function->GetFunc();
                 if (func_ptr && func_ptr != Unreal::UObject::ProcessInternalInternal.get_function_address() &&
@@ -2314,14 +2309,8 @@ Overloads:
                 class_outer_fname = Unreal::FName(name_parts.front(), Unreal::FNAME_Add);
             }
 
-            LuaMod::m_static_construct_object_lua_callbacks.emplace_back(LuaMod::LuaCancellableCallbackData{
-                LuaMod::m_next_static_construct_callback_id++,
-                hook_lua,
-                class_fname,
-                class_outer_fname,
-                func_ref,
-                thread_ref
-            });
+            LuaMod::m_static_construct_object_lua_callbacks.emplace_back(
+                    LuaMod::LuaCancellableCallbackData{LuaMod::m_next_static_construct_callback_id++, hook_lua, class_fname, class_outer_fname, func_ref, thread_ref});
 
             Output::send<LogLevel::Verbose>(STR("[NotifyOnNewObject] Registered notification for {}\n"), class_name);
 
@@ -2361,7 +2350,8 @@ Overloads:
                         LuaMod::LuaCallbackData{
                                 .lua = hook_lua,
                                 .instance_of_class = nullptr,
-                                .registry_indexes = {std::pair<const LuaMadeSimple::Lua*, LuaMod::LuaCallbackData::RegistryIndex>{hook_lua, {lua_callback_registry_index}}},
+                                .registry_indexes = {std::pair<const LuaMadeSimple::Lua*, LuaMod::LuaCallbackData::RegistryIndex>{hook_lua,
+                                                                                                                                  {lua_callback_registry_index}}},
                         }});
             }
 
@@ -3712,10 +3702,7 @@ Overloads:
         if (!deferred.empty())
         {
             std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
-            actions.insert(
-                actions.end(),
-                std::make_move_iterator(deferred.begin()),
-                std::make_move_iterator(deferred.end()));
+            actions.insert(actions.end(), std::make_move_iterator(deferred.begin()), std::make_move_iterator(deferred.end()));
         }
     }
 
@@ -3762,11 +3749,11 @@ Overloads:
                     continue;
                 }
 
-                auto callback_it = std::find_if(
-                    LuaMod::m_static_construct_object_lua_callbacks.begin(),
-                    LuaMod::m_static_construct_object_lua_callbacks.end(),
-                    [&](const LuaMod::LuaCancellableCallbackData& callback) { return callback.callback_id == pending.callback_id; }
-                );
+                auto callback_it = std::find_if(LuaMod::m_static_construct_object_lua_callbacks.begin(),
+                                                LuaMod::m_static_construct_object_lua_callbacks.end(),
+                                                [&](const LuaMod::LuaCancellableCallbackData& callback) {
+                                                    return callback.callback_id == pending.callback_id;
+                                                });
                 if (callback_it == LuaMod::m_static_construct_object_lua_callbacks.end())
                 {
                     continue;
@@ -3998,18 +3985,16 @@ Overloads:
             LuaMod::m_is_processing_actions = false;
             if (!LuaMod::m_pending_game_thread_actions.empty())
             {
-                LuaMod::m_game_thread_actions.insert(
-                    LuaMod::m_game_thread_actions.end(),
-                    std::make_move_iterator(LuaMod::m_pending_game_thread_actions.begin()),
-                    std::make_move_iterator(LuaMod::m_pending_game_thread_actions.end()));
+                LuaMod::m_game_thread_actions.insert(LuaMod::m_game_thread_actions.end(),
+                                                     std::make_move_iterator(LuaMod::m_pending_game_thread_actions.begin()),
+                                                     std::make_move_iterator(LuaMod::m_pending_game_thread_actions.end()));
                 LuaMod::m_pending_game_thread_actions.clear();
             }
             if (!LuaMod::m_pending_delayed_game_thread_actions.empty())
             {
-                LuaMod::m_delayed_game_thread_actions.insert(
-                    LuaMod::m_delayed_game_thread_actions.end(),
-                    std::make_move_iterator(LuaMod::m_pending_delayed_game_thread_actions.begin()),
-                    std::make_move_iterator(LuaMod::m_pending_delayed_game_thread_actions.end()));
+                LuaMod::m_delayed_game_thread_actions.insert(LuaMod::m_delayed_game_thread_actions.end(),
+                                                             std::make_move_iterator(LuaMod::m_pending_delayed_game_thread_actions.begin()),
+                                                             std::make_move_iterator(LuaMod::m_pending_delayed_game_thread_actions.end()));
                 LuaMod::m_pending_delayed_game_thread_actions.clear();
             }
         }
@@ -4035,18 +4020,16 @@ Overloads:
             LuaMod::m_is_processing_actions = false;
             if (!LuaMod::m_pending_engine_tick_actions.empty())
             {
-                LuaMod::m_engine_tick_actions.insert(
-                    LuaMod::m_engine_tick_actions.end(),
-                    std::make_move_iterator(LuaMod::m_pending_engine_tick_actions.begin()),
-                    std::make_move_iterator(LuaMod::m_pending_engine_tick_actions.end()));
+                LuaMod::m_engine_tick_actions.insert(LuaMod::m_engine_tick_actions.end(),
+                                                     std::make_move_iterator(LuaMod::m_pending_engine_tick_actions.begin()),
+                                                     std::make_move_iterator(LuaMod::m_pending_engine_tick_actions.end()));
                 LuaMod::m_pending_engine_tick_actions.clear();
             }
             if (!LuaMod::m_pending_delayed_game_thread_actions.empty())
             {
-                LuaMod::m_delayed_game_thread_actions.insert(
-                    LuaMod::m_delayed_game_thread_actions.end(),
-                    std::make_move_iterator(LuaMod::m_pending_delayed_game_thread_actions.begin()),
-                    std::make_move_iterator(LuaMod::m_pending_delayed_game_thread_actions.end()));
+                LuaMod::m_delayed_game_thread_actions.insert(LuaMod::m_delayed_game_thread_actions.end(),
+                                                             std::make_move_iterator(LuaMod::m_pending_delayed_game_thread_actions.begin()),
+                                                             std::make_move_iterator(LuaMod::m_pending_delayed_game_thread_actions.end()));
                 LuaMod::m_pending_delayed_game_thread_actions.clear();
             }
         }
@@ -4142,8 +4125,14 @@ Overloads:
             if (func_ptr && func_ptr != Unreal::UObject::ProcessInternalInternal.get_function_address() &&
                 unreal_function->HasAnyFunctionFlags(Unreal::EFunctionFlags::FUNC_Native))
             {
-                auto& custom_data = g_hooked_script_function_data.emplace_back(std::make_unique<LuaUnrealScriptFunctionData>(
-                        0, 0, unreal_function, mod, *hook_lua, lua_callback_registry_index, lua_post_callback_registry_index, lua_thread_registry_index));
+                auto& custom_data = g_hooked_script_function_data.emplace_back(std::make_unique<LuaUnrealScriptFunctionData>(0,
+                                                                                                                             0,
+                                                                                                                             unreal_function,
+                                                                                                                             mod,
+                                                                                                                             *hook_lua,
+                                                                                                                             lua_callback_registry_index,
+                                                                                                                             lua_post_callback_registry_index,
+                                                                                                                             lua_thread_registry_index));
                 pre_id = unreal_function->RegisterPreHook(&lua_unreal_script_function_hook_pre, custom_data.get());
                 post_id = unreal_function->RegisterPostHook(&lua_unreal_script_function_hook_post, custom_data.get());
                 custom_data->pre_callback_id = pre_id;
@@ -4166,10 +4155,7 @@ Overloads:
                 pre_id = Unreal::UnrealScriptFunctionData::MakeNewId();
                 post_id = pre_id;
                 callback_data.registry_indexes.emplace_back(hook_lua, LuaCallbackData::RegistryIndex{lua_callback_registry_index, pre_id});
-                Output::send<LogLevel::Verbose>(STR("[RegisterHook] Registered script hook ({}, {}) for {}\n"),
-                                                pre_id,
-                                                post_id,
-                                                unreal_function->GetFullName());
+                Output::send<LogLevel::Verbose>(STR("[RegisterHook] Registered script hook ({}, {}) for {}\n"), pre_id, post_id, unreal_function->GetFullName());
             }
             else
             {
@@ -4187,7 +4173,6 @@ Overloads:
 
             return 2;
         });
-
 
         // Register EGameThreadMethod enum table
         {
@@ -4463,7 +4448,8 @@ Overloads:
                     LuaMod::ensure_process_event_hooked(mod);
                     if (!is_process_event_hook_available())
                     {
-                        lua.throw_error("RetriggerableExecuteInGameThreadWithDelay: Neither EngineTick nor ProcessEvent hooks are available (AOB scans failed)");
+                        lua.throw_error(
+                                "RetriggerableExecuteInGameThreadWithDelay: Neither EngineTick nor ProcessEvent hooks are available (AOB scans failed)");
                     }
                     method = GameThreadExecutionMethod::ProcessEvent;
                 }
@@ -4476,7 +4462,8 @@ Overloads:
                     LuaMod::ensure_engine_tick_hooked();
                     if (!is_engine_tick_hook_available())
                     {
-                        lua.throw_error("RetriggerableExecuteInGameThreadWithDelay: Neither EngineTick nor ProcessEvent hooks are available (AOB scans failed)");
+                        lua.throw_error(
+                                "RetriggerableExecuteInGameThreadWithDelay: Neither EngineTick nor ProcessEvent hooks are available (AOB scans failed)");
                     }
                     method = GameThreadExecutionMethod::EngineTick;
                 }
@@ -4496,7 +4483,7 @@ Overloads:
                     // Reset the timer for the existing action
                     action.delay_ms = delay_ms;
                     action.execute_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
-                    action.status = LuaMod::DelayedActionStatus::Active;  // Unpause if paused
+                    action.status = LuaMod::DelayedActionStatus::Active; // Unpause if paused
                     lua.set_integer(handle);
                     return 1;
                 }
@@ -4508,7 +4495,7 @@ Overloads:
                     // Reset the timer for the existing action in pending queue
                     action.delay_ms = delay_ms;
                     action.execute_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
-                    action.status = LuaMod::DelayedActionStatus::Active;  // Unpause if paused
+                    action.status = LuaMod::DelayedActionStatus::Active; // Unpause if paused
                     lua.set_integer(handle);
                     return 1;
                 }
@@ -4769,7 +4756,7 @@ Overloads:
                         {
                             action.execute_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(action.delay_ms);
                         }
-                        action.status = LuaMod::DelayedActionStatus::Active;  // Unpause if paused
+                        action.status = LuaMod::DelayedActionStatus::Active; // Unpause if paused
                         found = true;
                         break;
                     }
@@ -4837,7 +4824,7 @@ Overloads:
                             action.delay_ms = new_delay;
                             action.execute_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(new_delay);
                         }
-                        action.status = LuaMod::DelayedActionStatus::Active;  // Unpause if paused
+                        action.status = LuaMod::DelayedActionStatus::Active; // Unpause if paused
                         found = true;
                         break;
                     }
@@ -5486,7 +5473,7 @@ Overloads:
             {
                 lua.throw_error(error_overload_not_found);
             }
-                        
+
             UE4SSProgram::get_program().queue_reinstall_mod_by_name(lua.get_string());
 
             return 0;
@@ -5503,7 +5490,7 @@ Overloads:
             {
                 lua.throw_error(error_overload_not_found);
             }
-            
+
             UE4SSProgram::get_program().queue_uninstall_mod_by_name(lua.get_string());
 
             return 0;
@@ -5655,47 +5642,44 @@ Overloads:
 
         // FString Class -> START
         // Pre-load the global FString constructor
-        lua.register_function("FString",
-                              [](const LuaMadeSimple::Lua& lua) -> int {
-                                  if (lua.get_stack_size() < 1 || !lua.is_string())
-                                  {
-                                      lua.throw_error("FString constructor requires a string argument");
-                                  }
-                                  std::string_view str = lua.get_string();
-                                  auto fstring = Unreal::FString(ensure_str(std::string(str)).c_str());
-                                  LuaType::FString::construct(lua, &fstring);
-                                  return 1;
-                              });
+        lua.register_function("FString", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (lua.get_stack_size() < 1 || !lua.is_string())
+            {
+                lua.throw_error("FString constructor requires a string argument");
+            }
+            std::string_view str = lua.get_string();
+            auto fstring = Unreal::FString(ensure_str(std::string(str)).c_str());
+            LuaType::FString::construct(lua, &fstring);
+            return 1;
+        });
         // FString Class -> END
 
         // FUtf8String Class -> START
         // Pre-load the global FUtf8String constructor
-        lua.register_function("FUtf8String",
-                              [](const LuaMadeSimple::Lua& lua) -> int {
-                                  if (lua.get_stack_size() < 1 || !lua.is_string())
-                                  {
-                                      lua.throw_error("FUtf8String constructor requires a string argument");
-                                  }
-                                  std::string_view str = lua.get_string();
-                                  auto utf8string = Unreal::FUtf8String(reinterpret_cast<const Unreal::UTF8CHAR*>(str.data()));
-                                  LuaType::FUtf8String::construct(lua, &utf8string);
-                                  return 1;
-                              });
+        lua.register_function("FUtf8String", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (lua.get_stack_size() < 1 || !lua.is_string())
+            {
+                lua.throw_error("FUtf8String constructor requires a string argument");
+            }
+            std::string_view str = lua.get_string();
+            auto utf8string = Unreal::FUtf8String(reinterpret_cast<const Unreal::UTF8CHAR*>(str.data()));
+            LuaType::FUtf8String::construct(lua, &utf8string);
+            return 1;
+        });
         // FUtf8String Class -> END
 
         // FAnsiString Class -> START
         // Pre-load the global FAnsiString constructor
-        lua.register_function("FAnsiString",
-                              [](const LuaMadeSimple::Lua& lua) -> int {
-                                  if (lua.get_stack_size() < 1 || !lua.is_string())
-                                  {
-                                      lua.throw_error("FAnsiString constructor requires a string argument");
-                                  }
-                                  std::string_view str = lua.get_string();
-                                  auto ansistring = Unreal::FAnsiString(str.data());
-                                  LuaType::FAnsiString::construct(lua, &ansistring);
-                                  return 1;
-                              });
+        lua.register_function("FAnsiString", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (lua.get_stack_size() < 1 || !lua.is_string())
+            {
+                lua.throw_error("FAnsiString constructor requires a string argument");
+            }
+            std::string_view str = lua.get_string();
+            auto ansistring = Unreal::FAnsiString(str.data());
+            LuaType::FAnsiString::construct(lua, &ansistring);
+            return 1;
+        });
         // FAnsiString Class -> END
 
         // FPackageName -> START
@@ -5900,33 +5884,35 @@ Overloads:
             make_async_state(this, lua());
             start_async_thread();
 
-            m_is_started = true;
-            fire_on_lua_start_for_cpp_mods();
-
             // Set up the custom module loader for handling UTF-8 paths
             setup_custom_module_loader(main_lua());
 
             // Use the scripts path that was already determined in the constructor
             std::filesystem::path main_script_path = m_scripts_path / STR("main.lua");
 
-            if (std::filesystem::exists(main_script_path))
-            {
-                if (!load_and_execute_script(main_script_path))
-                {
-                    Output::send<LogLevel::Error>(STR("Failed to execute main script: {}\n"), ensure_str(main_script_path));
-                }
-            }
-            else
+            if (!std::filesystem::exists(main_script_path))
             {
                 // This case implies m_scripts_path itself is valid, but main.lua is missing
                 Output::send<LogLevel::Error>(
                         STR("Main script 'main.lua' not found in scripts directory: {} -- Ensure your script file uses the correct casing.\n"),
                         ensure_str(m_scripts_path));
+                m_is_started = false;
+                return;
             }
+            if (!load_and_execute_script(main_script_path))
+            {
+                Output::send<LogLevel::Error>(STR("Failed to execute main script: {}\n"), ensure_str(main_script_path));
+                m_is_started = false;
+                return;
+            }
+
+            m_is_started = true;
+            fire_on_lua_start_for_cpp_mods();
         }
         catch (const std::exception& e)
         {
             Output::send<LogLevel::Error>(STR("Exception during mod startup: {}\n"), ensure_str(e.what()));
+            m_is_started = false;
         }
     }
 
@@ -5982,8 +5968,10 @@ Overloads:
 
         // Now acquire mutex to safely modify shared data structures
         std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
-
-        fire_on_lua_stop_for_cpp_mods();
+        if (m_is_started)
+        {
+            fire_on_lua_stop_for_cpp_mods();
+        }
 
         erase_from_container(this, m_static_construct_object_lua_callbacks);
         m_pending_notify_on_new_object_callbacks.clear();
@@ -5998,6 +5986,8 @@ Overloads:
         erase_from_container(this, m_init_game_state_post_callbacks);
         erase_from_container(this, m_begin_play_pre_callbacks);
         erase_from_container(this, m_begin_play_post_callbacks);
+        erase_from_container(this, m_end_play_pre_callbacks);
+        erase_from_container(this, m_end_play_post_callbacks);
         erase_from_container(this, m_call_function_by_name_with_arguments_pre_callbacks);
         erase_from_container(this, m_call_function_by_name_with_arguments_post_callbacks);
         erase_from_container(this, m_local_player_exec_pre_callbacks);
@@ -6005,27 +5995,24 @@ Overloads:
         erase_from_container(this, m_script_hook_callbacks);
 
         UE4SSProgram::get_program().get_all_input_events([&](auto& key_set) {
-            std::erase_if(key_set.key_data,
-                          [&](auto& item) -> bool {
-                              auto& [_, key_data] = item;
-                              std::erase_if(key_data,
-                                            [&](Input::KeyData& key_data) -> bool {
-                                                // custom_data == 1: Bind came from Lua, and custom_data2 is a pointer to LuaMod.
-                                                // custom_data == 2: Bind came from C++, and custom_data2 is a pointer to KeyDownEventData. Must free it.
-                                                if (key_data.custom_data == 1)
-                                                {
-                                                    return key_data.custom_data2 == this;
-                                                }
-                                                else
-                                                {
-                                                    return false;
-                                                }
-                                            });
+            std::erase_if(key_set.key_data, [&](auto& item) -> bool {
+                auto& [_, key_data] = item;
+                std::erase_if(key_data, [&](Input::KeyData& key_data) -> bool {
+                    // custom_data == 1: Bind came from Lua, and custom_data2 is a pointer to LuaMod.
+                    // custom_data == 2: Bind came from C++, and custom_data2 is a pointer to KeyDownEventData. Must free it.
+                    if (key_data.custom_data == 1)
+                    {
+                        return key_data.custom_data2 == this;
+                    }
+                    else
+                    {
+                        return false;
+                    }
+                });
 
-                              return key_data.empty();
-                          });
+                return key_data.empty();
+            });
         });
-
 
         // Mark all hooks for this mod as scheduled_for_removal FIRST
         // This prevents hooks from firing Lua code with a potentially invalid Lua state
@@ -6095,7 +6082,11 @@ Overloads:
 
         if (m_hook_lua != nullptr)
         {
-            m_hook_lua = nullptr; // lua_newthread results are handled by lua GC
+            if (GUI::LuaDebugger::has_instance())
+            {
+                GUI::LuaDebugger::get().unregister_lua_state(m_hook_lua->get_lua_state());
+            }
+            m_hook_lua = nullptr;
         }
 
         if (m_async_lua && m_async_lua->get_lua_state())
@@ -6109,6 +6100,12 @@ Overloads:
         }
 
         lua_close(lua().get_lua_state());
+        m_main_lua = nullptr;
+        m_async_lua = nullptr;
+        m_is_started = false;
+        m_installed = false;
+        m_hook_lua = nullptr;
+        m_hook_thread_ref = LUA_NOREF;
 
         // Now erase the hook data from g_hooked_script_function_data
         // This is safe because:
@@ -6141,6 +6138,15 @@ Overloads:
     {
         return lua().get_lua_state();
     }
+    auto LuaMod::ensure_hook_lua() -> LuaMadeSimple::Lua*
+    {
+        if (!m_hook_lua)
+        {
+            m_hook_lua = &m_lua.new_thread();
+            m_hook_thread_ref = luaL_ref(m_lua.get_lua_state(), LUA_REGISTRYINDEX);
+        }
+        return m_hook_lua;
+    }
 
     auto static start_console_lua_executor() -> void
     {
@@ -6162,7 +6168,10 @@ Overloads:
         LuaStatics::console_executor_enabled = false;
     }
 
-    static auto script_hook([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::UObject* Context, Unreal::FFrame& Stack, [[maybe_unused]] void* RESULT_DECL) -> void
+    static auto script_hook([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData,
+                            [[maybe_unused]] Unreal::UObject* Context,
+                            Unreal::FFrame& Stack,
+                            [[maybe_unused]] void* RESULT_DECL) -> void
     {
         std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
 
@@ -6299,9 +6308,14 @@ Overloads:
     auto LuaMod::on_program_start() -> void
     {
         Unreal::UObjectArray::AddUObjectDeleteListener(&LuaType::FLuaObjectDeleteListener::s_lua_object_delete_listener);
-        const Unreal::Hook::FCallbackOptions common_opts {false, false, STR("UE4SS"), STR("LuaModImpl")};
+        const Unreal::Hook::FCallbackOptions common_opts{false, false, STR("UE4SS"), STR("LuaModImpl")};
         Unreal::Hook::RegisterLoadMapPreCallback(
-                [](Unreal::Hook::TCallbackIterationData<bool>& CallbackIterationData, Unreal::UEngine* Engine, Unreal::FWorldContext& WorldContext, Unreal::FURL URL, Unreal::UPendingNetGame* PendingGame, Unreal::FString& Error) {
+                [](Unreal::Hook::TCallbackIterationData<bool>& CallbackIterationData,
+                   Unreal::UEngine* Engine,
+                   Unreal::FWorldContext& WorldContext,
+                   Unreal::FURL URL,
+                   Unreal::UPendingNetGame* PendingGame,
+                   Unreal::FString& Error) {
                     TRY([&] {
                         for (const auto& callback_data : m_load_map_pre_callbacks)
                         {
@@ -6333,10 +6347,16 @@ Overloads:
                             }
                         }
                     });
-                }, common_opts);
+                },
+                common_opts);
 
         Unreal::Hook::RegisterLoadMapPostCallback(
-                [](Unreal::Hook::TCallbackIterationData<bool>& CallbackIterationData, Unreal::UEngine* Engine, Unreal::FWorldContext& WorldContext, Unreal::FURL URL, Unreal::UPendingNetGame* PendingGame, Unreal::FString& Error) {
+                [](Unreal::Hook::TCallbackIterationData<bool>& CallbackIterationData,
+                   Unreal::UEngine* Engine,
+                   Unreal::FWorldContext& WorldContext,
+                   Unreal::FURL URL,
+                   Unreal::UPendingNetGame* PendingGame,
+                   Unreal::FString& Error) {
                     TRY([&] {
                         for (const auto& callback_data : m_load_map_post_callbacks)
                         {
@@ -6368,113 +6388,130 @@ Overloads:
                             }
                         }
                     });
-                }, common_opts);
+                },
+                common_opts);
 
-        Unreal::Hook::RegisterInitGameStatePreCallback([]([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AGameModeBase* Context) {
-            TRY([&] {
-                for (const auto& callback_data : m_init_game_state_pre_callbacks)
-                {
-                    for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
-                    {
-                        const auto& lua = *lua_ptr;
+        Unreal::Hook::RegisterInitGameStatePreCallback(
+                []([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AGameModeBase* Context) {
+                    TRY([&] {
+                        for (const auto& callback_data : m_init_game_state_pre_callbacks)
+                        {
+                            for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
+                            {
+                                const auto& lua = *lua_ptr;
 
-                        lua.registry().get_function_ref(registry_index.lua_index);
-                        static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
-                        LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
-                        lua.call_function(1, 0);
-                    }
-                }
-            });
-        }, common_opts);
+                                lua.registry().get_function_ref(registry_index.lua_index);
+                                static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
+                                LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
+                                lua.call_function(1, 0);
+                            }
+                        }
+                    });
+                },
+                common_opts);
 
-        Unreal::Hook::RegisterInitGameStatePostCallback([]([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AGameModeBase* Context) {
-            TRY([&] {
-                for (const auto& callback_data : m_init_game_state_post_callbacks)
-                {
-                    for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
-                    {
-                        const auto& lua = *lua_ptr;
+        Unreal::Hook::RegisterInitGameStatePostCallback(
+                []([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AGameModeBase* Context) {
+                    TRY([&] {
+                        for (const auto& callback_data : m_init_game_state_post_callbacks)
+                        {
+                            for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
+                            {
+                                const auto& lua = *lua_ptr;
 
-                        lua.registry().get_function_ref(registry_index.lua_index);
-                        static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
-                        LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
-                        lua.call_function(1, 0);
-                    }
-                }
-            });
-        }, common_opts);
+                                lua.registry().get_function_ref(registry_index.lua_index);
+                                static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
+                                LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
+                                lua.call_function(1, 0);
+                            }
+                        }
+                    });
+                },
+                common_opts);
 
-        Unreal::Hook::RegisterBeginPlayPreCallback([]([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AActor* Context) {
-            TRY([&] {
-                for (const auto& callback_data : m_begin_play_pre_callbacks)
-                {
-                    for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
-                    {
-                        const auto& lua = *lua_ptr;
+        Unreal::Hook::RegisterBeginPlayPreCallback(
+                []([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AActor* Context) {
+                    TRY([&] {
+                        for (const auto& callback_data : m_begin_play_pre_callbacks)
+                        {
+                            for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
+                            {
+                                const auto& lua = *lua_ptr;
 
-                        lua.registry().get_function_ref(registry_index.lua_index);
-                        static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
-                        LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
-                        lua.call_function(1, 0);
-                    }
-                }
-            });
-        }, common_opts);
+                                lua.registry().get_function_ref(registry_index.lua_index);
+                                static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
+                                LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
+                                lua.call_function(1, 0);
+                            }
+                        }
+                    });
+                },
+                common_opts);
 
-        Unreal::Hook::RegisterBeginPlayPostCallback([]([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AActor* Context) {
-            TRY([&] {
-                for (const auto& callback_data : m_begin_play_post_callbacks)
-                {
-                    for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
-                    {
-                        const auto& lua = *lua_ptr;
+        Unreal::Hook::RegisterBeginPlayPostCallback(
+                []([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AActor* Context) {
+                    TRY([&] {
+                        for (const auto& callback_data : m_begin_play_post_callbacks)
+                        {
+                            for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
+                            {
+                                const auto& lua = *lua_ptr;
 
-                        lua.registry().get_function_ref(registry_index.lua_index);
-                        static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
-                        LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
-                        lua.call_function(1, 0);
-                    }
-                }
-            });
-        }, common_opts);
+                                lua.registry().get_function_ref(registry_index.lua_index);
+                                static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
+                                LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
+                                lua.call_function(1, 0);
+                            }
+                        }
+                    });
+                },
+                common_opts);
 
-        Unreal::Hook::RegisterEndPlayPreCallback([]([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AActor* Context, Unreal::EEndPlayReason EndPlayReason) {
-            TRY([&] {
-                for (const auto& callback_data : m_end_play_pre_callbacks)
-                {
-                    for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
-                    {
-                        const auto& lua = *lua_ptr;
+        Unreal::Hook::RegisterEndPlayPreCallback(
+                []([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData,
+                   [[maybe_unused]] Unreal::AActor* Context,
+                   Unreal::EEndPlayReason EndPlayReason) {
+                    TRY([&] {
+                        for (const auto& callback_data : m_end_play_pre_callbacks)
+                        {
+                            for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
+                            {
+                                const auto& lua = *lua_ptr;
 
-                        lua.registry().get_function_ref(registry_index.lua_index);
-                        static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
-                        LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
-                        static auto s_int_property_name = Unreal::FName(STR("IntProperty"), Unreal::FNAME_Find);
-                        LuaType::RemoteUnrealParam::construct(lua, &EndPlayReason, s_int_property_name);
-                        lua.call_function(2, 0);
-                    }
-                }
-            });
-        }, common_opts);
+                                lua.registry().get_function_ref(registry_index.lua_index);
+                                static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
+                                LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
+                                static auto s_int_property_name = Unreal::FName(STR("IntProperty"), Unreal::FNAME_Find);
+                                LuaType::RemoteUnrealParam::construct(lua, &EndPlayReason, s_int_property_name);
+                                lua.call_function(2, 0);
+                            }
+                        }
+                    });
+                },
+                common_opts);
 
-        Unreal::Hook::RegisterEndPlayPostCallback([]([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AActor* Context, Unreal::EEndPlayReason EndPlayReason) {
-            TRY([&] {
-                for (const auto& callback_data : m_end_play_post_callbacks)
-                {
-                    for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
-                    {
-                        const auto& lua = *lua_ptr;
+        Unreal::Hook::RegisterEndPlayPostCallback(
+                []([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData,
+                   [[maybe_unused]] Unreal::AActor* Context,
+                   Unreal::EEndPlayReason EndPlayReason) {
+                    TRY([&] {
+                        for (const auto& callback_data : m_end_play_post_callbacks)
+                        {
+                            for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
+                            {
+                                const auto& lua = *lua_ptr;
 
-                        lua.registry().get_function_ref(registry_index.lua_index);
-                        static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
-                        LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
-                        static auto s_int_property_name = Unreal::FName(STR("IntProperty"), Unreal::FNAME_Find);
-                        LuaType::RemoteUnrealParam::construct(lua, &EndPlayReason, s_int_property_name);
-                        lua.call_function(2, 0);
-                    }
-                }
-            });
-        }, common_opts);
+                                lua.registry().get_function_ref(registry_index.lua_index);
+                                static auto s_object_property_name = Unreal::FName(STR("ObjectProperty"), Unreal::FNAME_Find);
+                                LuaType::RemoteUnrealParam::construct(lua, &Context, s_object_property_name);
+                                static auto s_int_property_name = Unreal::FName(STR("IntProperty"), Unreal::FNAME_Find);
+                                LuaType::RemoteUnrealParam::construct(lua, &EndPlayReason, s_int_property_name);
+                                lua.call_function(2, 0);
+                            }
+                        }
+                    });
+                },
+                common_opts);
 
         Unreal::Hook::RegisterStaticConstructObjectPostCallback([](const Unreal::FStaticConstructObjectParameters&, Unreal::UObject* constructed_object) {
             return TRY([&] {
@@ -6494,7 +6531,8 @@ Overloads:
                         callbacks_to_execute.reserve(m_static_construct_object_lua_callbacks.size());
                         for (const auto& callback_data : m_static_construct_object_lua_callbacks)
                         {
-                            if (object_class->GetNamePrivate().Equals(callback_data.instance_class_name) && object_class->GetOuterPrivate()->GetNamePrivate().Equals(callback_data.instance_class_outer_name))
+                            if (object_class->GetNamePrivate().Equals(callback_data.instance_class_name) &&
+                                object_class->GetOuterPrivate()->GetNamePrivate().Equals(callback_data.instance_class_outer_name))
                             {
                                 callbacks_to_execute.push_back(callback_data.callback_id);
                             }
@@ -6503,11 +6541,11 @@ Overloads:
                         std::unordered_set<uint64_t> callbacks_to_remove{};
                         for (uint64_t callback_id : callbacks_to_execute)
                         {
-                            auto callback_it = std::find_if(
-                                m_static_construct_object_lua_callbacks.begin(),
-                                m_static_construct_object_lua_callbacks.end(),
-                                [&](const LuaMod::LuaCancellableCallbackData& callback) { return callback.callback_id == callback_id; }
-                            );
+                            auto callback_it = std::find_if(m_static_construct_object_lua_callbacks.begin(),
+                                                            m_static_construct_object_lua_callbacks.end(),
+                                                            [&](const LuaMod::LuaCancellableCallbackData& callback) {
+                                                                return callback.callback_id == callback_id;
+                                                            });
                             if (callback_it == m_static_construct_object_lua_callbacks.end())
                             {
                                 continue;
@@ -6548,7 +6586,8 @@ Overloads:
                         // NOT on game thread - queue callbacks for later processing
                         for (const auto& callback_data : m_static_construct_object_lua_callbacks)
                         {
-                            if (object_class->GetNamePrivate().Equals(callback_data.instance_class_name) && object_class->GetOuterPrivate()->GetNamePrivate().Equals(callback_data.instance_class_outer_name))
+                            if (object_class->GetNamePrivate().Equals(callback_data.instance_class_name) &&
+                                object_class->GetOuterPrivate()->GetNamePrivate().Equals(callback_data.instance_class_outer_name))
                             {
                                 int32_t object_index = constructed_object->GetInternalIndex();
                                 Unreal::FUObjectItem* object_item = Unreal::FUObjectArray::IndexToObject(object_index);
@@ -6561,12 +6600,7 @@ Overloads:
                                 // Include validation fields to detect if callback was removed/modified
                                 const auto serial = object_item->GetSerialNumber();
                                 m_pending_notify_on_new_object_callbacks.push_back(
-                                    LuaMod::PendingNotifyOnNewObjectCallback{
-                                        callback_data.callback_id,
-                                        object_index,
-                                        serial
-                                    }
-                                );
+                                        LuaMod::PendingNotifyOnNewObjectCallback{callback_data.callback_id, object_index, serial});
                             }
                         }
                     }

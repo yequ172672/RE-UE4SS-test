@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -32,7 +33,7 @@ namespace RC::GUI
         std::string source;
         int line_number{0};
         int current_line{0};
-        std::string what; // "Lua", "C", "main", "tail"
+        std::string what;      // "Lua", "C", "main", "tail"
         std::string name_what; // "global", "local", "method", "field", ""
     };
 
@@ -40,7 +41,7 @@ namespace RC::GUI
     struct LuaStackSlot
     {
         int index{0};
-        std::string type_name; // "nil", "boolean", "number", "string", "table", "function", "userdata", "thread", "lightuserdata"
+        std::string type_name;     // "nil", "boolean", "number", "string", "table", "function", "userdata", "thread", "lightuserdata"
         std::string value_preview; // Short string representation of the value
         bool is_table{false};
         bool is_userdata{false};
@@ -129,20 +130,32 @@ namespace RC::GUI
         std::vector<LuaStackSlot> current_stack;
         bool is_active{true};
     };
+    struct LuaDebugSnapshot
+    {
+        bool paused{false};
+        uint64_t generation{0};
+        std::string mod_name;
+        std::string state_type;
+        std::string source;
+        int line{0};
+        std::vector<LuaStackSlot> stack_slots;
+        std::vector<LuaCallStackEntry> call_stack;
+        std::vector<LuaStackFrame> stack_frames;
+    };
 
     class LuaDebugger
     {
-    public:
+      public:
         static constexpr size_t MAX_ERROR_HISTORY = 100;
         static constexpr size_t MAX_STACK_PREVIEW_LENGTH = 64;
         static constexpr size_t MAX_REPL_HISTORY = 100;
         static constexpr size_t MAX_TABLE_DEPTH = 10;
 
-    private:
+      private:
         // All tracked Lua states
         std::unordered_map<lua_State*, LuaStateInfo> m_lua_states;
         mutable std::mutex m_states_mutex;
-        
+
         std::deque<LuaErrorRecord> m_error_history;
         mutable std::mutex m_errors_mutex;
 
@@ -153,7 +166,7 @@ namespace RC::GUI
         bool m_show_stack_details{true};
         bool m_pause_on_error{false};
         std::string m_error_filter;
-        
+
         static LuaDebugger* s_instance;
 
         // Breakpoints
@@ -164,7 +177,7 @@ namespace RC::GUI
         std::atomic<bool> m_step_over_requested{false};
         std::atomic<bool> m_step_out_requested{false};
         std::atomic<bool> m_continue_requested{false};
-        lua_State* m_paused_state{nullptr};
+        std::atomic<lua_State*> m_paused_state{nullptr};
         int m_paused_line{0};
         std::string m_paused_source;
         std::condition_variable m_pause_cv;
@@ -177,9 +190,11 @@ namespace RC::GUI
         std::vector<LuaCallStackEntry> m_paused_call_stack;
         std::vector<LuaStackFrame> m_paused_stack_frames; // Call stack with local variables
         mutable std::mutex m_paused_data_mutex;
+        uint64_t m_pause_generation{0};
 
         // Track which states have debug hooks installed
         std::set<lua_State*> m_states_with_hooks;
+        mutable std::mutex m_hooks_mutex;
 
         // Script viewer (for Debug view)
         std::unordered_map<std::string, LuaScriptFile> m_script_cache;
@@ -218,7 +233,7 @@ namespace RC::GUI
         // Stack frame expansion state (-1 = no change, 0 = collapse all, 1 = expand all)
         int m_stack_frames_expand_action{-1};
 
-    public:
+      public:
         LuaDebugger();
         ~LuaDebugger();
 
@@ -234,6 +249,7 @@ namespace RC::GUI
         auto record_error(lua_State* L, const std::string& error_message, const std::string& traceback) -> void;
         auto clear_error_history() -> void;
         auto get_error_count() const -> size_t;
+        auto get_error_history() const -> std::vector<LuaErrorRecord>;
 
         // Stack inspection utilities
         static auto get_stack_slots(lua_State* L) -> std::vector<LuaStackSlot>;
@@ -249,7 +265,12 @@ namespace RC::GUI
         auto toggle_breakpoint(const std::string& source, int line) -> void;
         auto clear_all_breakpoints() -> void;
         auto has_breakpoint(const std::string& source, int line) const -> bool;
-        auto is_paused() const -> bool { return m_is_paused.load(); }
+        auto is_paused() const -> bool
+        {
+            return m_is_paused.load();
+        }
+        auto get_breakpoints() const -> std::vector<LuaBreakpoint>;
+        auto get_paused_snapshot() const -> LuaDebugSnapshot;
 
         // Debug control
         auto continue_execution() -> void;
@@ -279,7 +300,7 @@ namespace RC::GUI
         // GUI rendering
         auto render() -> void;
 
-    private:
+      private:
         auto render_state_list() -> void;
         auto render_stack_view() -> void;
         auto render_globals_view() -> void;
@@ -330,7 +351,10 @@ namespace RC::GUI
             bool enabled_via_mods_txt{false};
             bool is_running{false};
 
-            bool is_enabled() const { return enabled_via_txt || enabled_via_mods_txt; }
+            bool is_enabled() const
+            {
+                return enabled_via_txt || enabled_via_mods_txt;
+            }
         };
 
         std::vector<ModInfo> m_discovered_mods;

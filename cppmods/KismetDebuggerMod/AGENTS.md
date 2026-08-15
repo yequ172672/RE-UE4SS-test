@@ -8,7 +8,8 @@ KismetDebugger 通过替换 `GNatives_Internal` 项拦截脚本执行，实现�
 
 | 文件 | 作用 |
 | --- | --- |
-| `include/KismetDebugger.hpp` | 断点、opcode、原函数与同步状态。 |
+| `include/KismetDebugger.hpp` | 断点、opcode、原函数、暂停同步状态与可序列化调试快照。 |
+| `include/KismetDebuggerApi.hpp` | 供 UE4SS MCP 动态发现的版本化 C 导出接口。 |
 | `src/KismetDebugger.cpp` | native 表替换、命中/暂停/单步、恢复与 UI。 |
 | `src/dllmain.cpp` | Mod DLL 导出入口。 |
 | `CMakeLists.txt` / `xmake.lua` | 两套 target 定义。 |
@@ -19,6 +20,7 @@ KismetDebugger 通过替换 `GNatives_Internal` 项拦截脚本执行，实现�
 - 暂停发生在游戏线程；等待必须可解除，并能处理关闭 UI、禁用 Mod、卸载 DLL 和游戏退出。
 - 状态跨 UI/游戏线程共享时使用明确同步；不要依赖固定延迟证明回调已经退出。
 - Breakpoint、Step Into/Over/Out 的 opcode/栈语义必须以真实字节码执行路径验证。
+- MCP 接口只能通过版本化导出函数访问；所有状态读写复用调试器自身锁与暂停控制，不允许 UE4SS 依赖 Mod 的 C++ 对象布局。
 
 ## 验证
 

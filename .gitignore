@@ -79,3 +79,8 @@ vsxmake2022
 
 # xwin
 xwin/*
+
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]

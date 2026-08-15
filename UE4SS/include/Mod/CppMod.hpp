@@ -42,20 +42,15 @@ namespace RC
       public:
         auto start_mod() -> void override;
         auto uninstall() -> void override;
+        [[nodiscard]] auto get_export(const char* name) const -> void*;
 
-        auto fire_on_lua_start(StringViewType mod_name,
-                               LuaMadeSimple::Lua& lua,
-                               LuaMadeSimple::Lua& main_lua,
-                               LuaMadeSimple::Lua& async_lua,
-                               LuaMadeSimple::Lua* hook_lua) -> void;
+        auto fire_on_lua_start(StringViewType mod_name, LuaMadeSimple::Lua& lua, LuaMadeSimple::Lua& main_lua, LuaMadeSimple::Lua& async_lua, LuaMadeSimple::Lua* hook_lua)
+                -> void;
 
         auto fire_on_lua_start(LuaMadeSimple::Lua& lua, LuaMadeSimple::Lua& main_lua, LuaMadeSimple::Lua& async_lua, LuaMadeSimple::Lua* hook_lua) -> void;
 
-        auto fire_on_lua_stop(StringViewType mod_name,
-                              LuaMadeSimple::Lua& lua,
-                              LuaMadeSimple::Lua& main_lua,
-                              LuaMadeSimple::Lua& async_lua,
-                              LuaMadeSimple::Lua* hook_lua) -> void;
+        auto fire_on_lua_stop(StringViewType mod_name, LuaMadeSimple::Lua& lua, LuaMadeSimple::Lua& main_lua, LuaMadeSimple::Lua& async_lua, LuaMadeSimple::Lua* hook_lua)
+                -> void;
 
         auto fire_on_lua_stop(LuaMadeSimple::Lua& lua, LuaMadeSimple::Lua& main_lua, LuaMadeSimple::Lua& async_lua, LuaMadeSimple::Lua* hook_lua) -> void;
 

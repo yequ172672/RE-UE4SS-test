@@ -29,7 +29,8 @@ namespace RC
             if (!std::filesystem::exists(dll_path))
             {
                 Output::send<LogLevel::Warning>(STR("Failed to load C++ mod {}, dlls folder must contain either main.dll or {}\n"),
-                                                m_mod_name, ensure_str(dll_path.filename()));
+                                                m_mod_name,
+                                                ensure_str(dll_path.filename()));
                 set_installable(false);
                 return;
             }
@@ -44,7 +45,9 @@ namespace RC
         if (!m_main_dll_module)
         {
             Output::send<LogLevel::Warning>(STR("Failed to load dll <{}> for mod {}, error: {}\n"),
-                                            ensure_str(dll_path), m_mod_name, SysError(GetLastError()).c_str());
+                                            ensure_str(dll_path),
+                                            m_mod_name,
+                                            SysError(GetLastError()).c_str());
             set_installable(false);
             return;
         }
@@ -95,12 +98,17 @@ namespace RC
             m_uninstall_mod_func(m_mod);
         }
     }
+    auto CppMod::get_export(const char* name) const -> void*
+    {
+        if (!m_main_dll_module || !name)
+        {
+            return nullptr;
+        }
+        return reinterpret_cast<void*>(GetProcAddress(m_main_dll_module, name));
+    }
 
-    auto CppMod::fire_on_lua_start(StringViewType mod_name,
-                                   LuaMadeSimple::Lua& lua,
-                                   LuaMadeSimple::Lua& main_lua,
-                                   LuaMadeSimple::Lua& async_lua,
-                                   LuaMadeSimple::Lua* hook_lua) -> void
+    auto CppMod::fire_on_lua_start(
+            StringViewType mod_name, LuaMadeSimple::Lua& lua, LuaMadeSimple::Lua& main_lua, LuaMadeSimple::Lua& async_lua, LuaMadeSimple::Lua* hook_lua) -> void
     {
         if (m_mod)
         {
@@ -117,10 +125,7 @@ namespace RC
         }
     }
 
-    auto CppMod::fire_on_lua_start(LuaMadeSimple::Lua& lua,
-                                   LuaMadeSimple::Lua& main_lua,
-                                   LuaMadeSimple::Lua& async_lua,
-                                   LuaMadeSimple::Lua* hook_lua) -> void
+    auto CppMod::fire_on_lua_start(LuaMadeSimple::Lua& lua, LuaMadeSimple::Lua& main_lua, LuaMadeSimple::Lua& async_lua, LuaMadeSimple::Lua* hook_lua) -> void
     {
         if (m_mod)
         {
@@ -137,11 +142,8 @@ namespace RC
         }
     }
 
-    auto CppMod::fire_on_lua_stop(StringViewType mod_name,
-                                  LuaMadeSimple::Lua& lua,
-                                  LuaMadeSimple::Lua& main_lua,
-                                  LuaMadeSimple::Lua& async_lua,
-                                  LuaMadeSimple::Lua* hook_lua) -> void
+    auto CppMod::fire_on_lua_stop(
+            StringViewType mod_name, LuaMadeSimple::Lua& lua, LuaMadeSimple::Lua& main_lua, LuaMadeSimple::Lua& async_lua, LuaMadeSimple::Lua* hook_lua) -> void
     {
         if (m_mod)
         {

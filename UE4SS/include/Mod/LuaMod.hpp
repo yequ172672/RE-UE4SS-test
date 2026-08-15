@@ -39,6 +39,7 @@ namespace RC
         LuaMadeSimple::Lua* m_hook_lua = nullptr;
         LuaMadeSimple::Lua* m_main_lua{};
         LuaMadeSimple::Lua* m_async_lua{};
+        int m_hook_thread_ref{-2};
 
       public:
         enum class ActionType
@@ -58,11 +59,11 @@ namespace RC
         // Status of a delayed action (mirrors UE's ETimerStatus)
         enum class DelayedActionStatus : uint8_t
         {
-            Pending,        // Created but not yet started
-            Active,         // Running, waiting for delay to expire
-            Paused,         // Timer paused, will resume when unpaused
-            Executing,      // Currently executing callback
-            PendingRemoval  // Marked for removal, will be cleaned up
+            Pending,       // Created but not yet started
+            Active,        // Running, waiting for delay to expire
+            Paused,        // Timer paused, will resume when unpaused
+            Executing,     // Currently executing callback
+            PendingRemoval // Marked for removal, will be cleaned up
         };
 
         struct DelayedGameThreadAction
@@ -72,15 +73,15 @@ namespace RC
             int32_t lua_action_thread_ref{};
             GameThreadExecutionMethod method{GameThreadExecutionMethod::EngineTick};
             DelayedActionStatus status{DelayedActionStatus::Active};
-            std::chrono::steady_clock::time_point execute_at{};  // Absolute time when action should execute
-            int64_t time_remaining_ms{0};  // Time remaining when paused (milliseconds)
-            int64_t frames_remaining{0};  // Countdown for frame-based delays
-            int64_t delay_ms{0};  // Original delay in milliseconds (for loop/reset)
-            int64_t delay_frames{0};  // Original delay in frames (0 means use time-based delay)
-            int64_t handle{0};  // Unique handle for this action
-            bool is_retriggerable{false};  // If true, can be reset by calling with same handle
-            bool is_looping{false};  // If true, re-schedule after each execution
-            bool pause_after_execution{false};  // Pause immediately after current callback returns
+            std::chrono::steady_clock::time_point execute_at{}; // Absolute time when action should execute
+            int64_t time_remaining_ms{0};                       // Time remaining when paused (milliseconds)
+            int64_t frames_remaining{0};                        // Countdown for frame-based delays
+            int64_t delay_ms{0};                                // Original delay in milliseconds (for loop/reset)
+            int64_t delay_frames{0};                            // Original delay in frames (0 means use time-based delay)
+            int64_t handle{0};                                  // Unique handle for this action
+            bool is_retriggerable{false};                       // If true, can be reset by calling with same handle
+            bool is_looping{false};                             // If true, re-schedule after each execution
+            bool pause_after_execution{false};                  // Pause immediately after current callback returns
         };
 
         static inline int64_t m_next_delayed_action_handle{1};
@@ -134,8 +135,8 @@ namespace RC
         // but Lua is NOT thread-safe, so we must defer Lua calls to the game thread
         struct PendingNotifyOnNewObjectCallback
         {
-            uint64_t callback_id{}; // Stable ID for matching callback safely
-            int32_t object_index{}; // UObject internal index
+            uint64_t callback_id{};  // Stable ID for matching callback safely
+            int32_t object_index{};  // UObject internal index
             int32_t object_serial{}; // Serial number for validity checks
         };
         struct FunctionHookData
@@ -223,8 +224,12 @@ namespace RC
         RC_UE4SS_API auto main_lua() const -> const LuaMadeSimple::Lua*;
         RC_UE4SS_API auto async_lua() const -> const LuaMadeSimple::Lua*;
         RC_UE4SS_API auto get_lua_state() const -> lua_State*;
+        RC_UE4SS_API auto ensure_hook_lua() -> LuaMadeSimple::Lua*;
 
-        RC_UE4SS_API auto get_scripts_path() const -> const std::filesystem::path& { return m_scripts_path; }
+        RC_UE4SS_API auto get_scripts_path() const -> const std::filesystem::path&
+        {
+            return m_scripts_path;
+        }
 
         RC_UE4SS_API auto actions_lock() -> void
         {

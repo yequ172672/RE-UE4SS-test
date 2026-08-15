@@ -1,0 +1,19 @@
+{
+  "bindAddress": "127.0.0.1",
+  "port": 0,
+  "runtimeEndpoint": "http://127.0.0.1:8182/mcp",
+  "stateDirectory": "../.ue4ss-mcp",
+  "maxWorkers": 4,
+  "roots": {
+    "repo": "..",
+    "mods": "../mcp-workspace/mods",
+    "artifacts": "../mcp-workspace/artifacts",
+    "game": "D:/Games/ExampleGame",
+    "gameBinaries": "D:/Games/ExampleGame/Binaries/Win64"
+  },
+  "tools": {
+    "cmake": "cmake",
+    "unrealEditor": "C:/Program Files/Epic Games/UE_5.4/Engine/Binaries/Win64/UnrealEditor-Cmd.exe",
+    "debugger": "C:/Tools/lldb-dap.exe"
+  }
+}
