@@ -7,8 +7,8 @@ TBD
 ## New
 
 ### General
-Added a local, opt-in MCP Streamable HTTP runtime endpoint for AI-assisted UE4SS development. It provides evidence-based session/capability discovery, paginated logs and events, reflected object/property access, game-thread calls, console commands, parameter-capturing hooks, Lua execution/reload/debugging, and Kismet debugging through a compatible `KismetDebuggerMod`, with structured operation and error states.
-Added an optional loopback-only Python MCP host for scoped file and artifact operations, scoped process lifecycle, bounded explicit-PID memory inspection, verified Lua/C++ mod lifecycle, cancellable CMake builds, Unreal Editor/Cook/package automation, DAP native debugging and output capture, crash artifact collection, task observation, and repeatable validation scenarios.
+Added a local, opt-in MCP Streamable HTTP runtime endpoint for AI-assisted UE4SS development. It provides evidence-based session/capability discovery, bounded multi-filter UObject queries, lifecycle-safe inspection and property watches, exact asset loading, game-thread calls, console commands, parameter-capturing hooks, Lua execution/lifecycle/debugging, observable built-in dumpers, and Kismet debugging through a compatible `KismetDebuggerMod`, with structured operation and error states.
+Added an optional loopback-only Python MCP host for scoped UE4SS settings profiling and atomic hash-guarded patching, file and artifact operations, scoped process lifecycle, bounded explicit-PID memory inspection, verified Lua/C++ mod lifecycle, cancellable CMake builds, Unreal Editor/Cook/package automation, DAP native debugging and output capture, crash artifact collection, host/runtime task routing, and repeatable validation scenarios.
 
 Added automatic game-specific compatibility configuration selection from `CustomGameConfigs`. Configurations can declare executable, Unreal project, and install-directory selectors in `GameConfig.ini`; `UE4SS-compatibility.ini` overlays only game-specific settings without replacing local MCP, GUI, hotkey, or mod settings.
 

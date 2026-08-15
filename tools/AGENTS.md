@@ -21,6 +21,7 @@
 | `buildscripts/release.py` | 版本提交、发布包、设置改写、资源归档和 release notes。 |
 | `mcp_smoke_test.py` | 对运行中的 UE4SS MCP 执行工具发现、日志读取、生命周期及传输失败场景验收。 |
 | `ue4ss_mcp_host.py` / `ue4ss_mcp_host.example.json` | 启动 loopback MCP 主机并配置显式工作区、运行时端点和工具链。 |
+| `mcp_host/settings.py` | 有界解析 UE4SS INI profile，并以期望哈希执行保留注释与顺序的原子设置 patch。 |
 | `test_mcp_host.py` | 外部主机传输、文件、模组、DAP 和场景回归测试。 |
 | `xmakescripts/build_configs.lua` | xmake 三段式 mode 定义。 |
 | `xmakescripts/rules/build_rules.lua` | mode 到编译定义/选项的映射。 |

@@ -19,6 +19,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | `SUMMARY.md` | mdBook 导航与章节权威源。 |
+| `guides/testing-ai-mcp.md` | AI MCP 本地构建、实机 Smoke、Host、可逆配置与故障排查指南。 |
 | `contributing.md` | PR、格式、兼容性验证、Changelog 和 breaking change 规则。 |
 | `upgrade-guide.md` | 公开破坏性变更迁移。 |
 | `lua-api.md` / `cpp-api.md` | 两类接口入口。 |

@@ -290,59 +290,97 @@ class ModManager:
         self.validate_name(name)
         mods = self.workspace.resolve(root, mods_path, must_exist=True)
         text_manifest = mods.path / "mods.txt"
-        previous: bool | None = None
+        enabled_marker = mods.path / name / "enabled.txt"
+        if not enabled and enabled_marker.is_file():
+            raise ToolError(
+                "mod.enabled_marker_conflict",
+                "The mod has an enabled.txt marker, which overrides a disabled mods.txt entry",
+                stage="mod.enable",
+                context={
+                    "name": name,
+                    "manifest": text_manifest.relative_to(mods.root).as_posix(),
+                    "enabledMarker": enabled_marker.relative_to(mods.root).as_posix(),
+                },
+                suggested_actions=["Remove the mod's enabled.txt marker, then retry the disable operation"],
+            )
 
+        lines: list[str] = []
         if text_manifest.is_file():
             try:
                 lines = text_manifest.read_text(encoding="utf-8-sig").splitlines()
             except OSError as error:
                 raise ToolError("mod.manifest_invalid", str(error), stage="mod.enable", context={"path": text_manifest.as_posix()}) from error
-            entry_pattern = re.compile(r"^\s*([^;][^:]*?)\s*:\s*([01])\s*$")
-            found_index: int | None = None
-            for index, line in enumerate(lines):
-                match = entry_pattern.match(line)
-                if match and match.group(1).strip() == name:
-                    found_index = index
-                    previous = match.group(2) == "1"
-                    break
-            replacement = f"{name} : {1 if enabled else 0}"
-            if found_index is not None:
-                lines[found_index] = replacement
-            else:
-                insert_at = next((index for index, line in enumerate(lines) if line.lstrip().startswith("; Built-in keybinds")), len(lines))
-                lines.insert(insert_at, replacement)
-            temporary = text_manifest.with_suffix(".txt.tmp")
+
+        entry_pattern = re.compile(r"^\s*([^;][^:]*?)\s*:\s*([01])\s*$")
+        found_indexes: list[int] = []
+        previous_entries: list[bool] = []
+        for index, line in enumerate(lines):
+            match = entry_pattern.match(line)
+            if match and match.group(1).strip() == name:
+                found_indexes.append(index)
+                previous_entries.append(match.group(2) == "1")
+
+        replacement = f"{name} : {1 if enabled else 0}"
+        if found_indexes:
+            for index in found_indexes:
+                lines[index] = replacement
+        else:
+            insert_at = next((index for index, line in enumerate(lines) if line.lstrip().startswith("; Built-in keybinds")), len(lines))
+            lines.insert(insert_at, replacement)
+
+        temporary = text_manifest.with_suffix(".txt.tmp")
+        try:
             temporary.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
             temporary.replace(text_manifest)
-            manifest_path = text_manifest
-        else:
-            manifest_path = mods.path / "mods.json"
-            entries: list[dict[str, Any]] = []
-            if manifest_path.is_file():
-                try:
-                    entries = json.loads(manifest_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError) as error:
-                    raise ToolError("mod.manifest_invalid", str(error), stage="mod.enable", context={"path": manifest_path.as_posix()}) from error
-            if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
-                raise ToolError("mod.manifest_invalid", "mods.json must contain an array of objects", stage="mod.enable", context={"path": manifest_path.as_posix()})
-            for entry in entries:
-                if entry.get("mod_name") == name:
-                    previous = bool(entry.get("mod_enabled"))
-                    entry["mod_enabled"] = enabled
-                    break
-            else:
-                entries.append({"mod_name": name, "mod_enabled": enabled})
-            temporary = manifest_path.with_suffix(".json.tmp")
-            temporary.write_text(json.dumps(entries, indent=4) + "\n", encoding="utf-8", newline="\n")
-            temporary.replace(manifest_path)
+        except OSError as error:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise ToolError(
+                "mod.manifest_write_failed",
+                str(error),
+                stage="mod.enable",
+                context={"path": text_manifest.as_posix()},
+                retryable=True,
+            ) from error
 
+        readback_lines = text_manifest.read_text(encoding="utf-8-sig").splitlines()
+        readback_values = [
+            match.group(2) == "1"
+            for line in readback_lines
+            if (match := entry_pattern.match(line)) and match.group(1).strip() == name
+        ]
+        if not readback_values or any(value != enabled for value in readback_values):
+            raise ToolError(
+                "mod.manifest_verification_failed",
+                "The controlling mods.txt did not contain the requested state after the atomic update",
+                stage="mod.verify",
+                context={"path": text_manifest.as_posix(), "name": name, "values": readback_values},
+            )
+
+        previous = any(previous_entries) if previous_entries else None
         changes = []
-        if previous != enabled:
-            changes.append({"kind": "mod_state", "action": "enabled" if enabled else "disabled", "name": name, "previous": previous})
+        if previous != enabled or len(previous_entries) > 1:
+            changes.append(
+                {
+                    "kind": "mod_state",
+                    "action": "enabled" if enabled else "disabled",
+                    "name": name,
+                    "previous": previous,
+                    "previousEntries": previous_entries,
+                }
+            )
         return {
-            "currentState": {"name": name, "enabled": enabled, "manifest": manifest_path.relative_to(mods.root).as_posix()},
+            "currentState": {
+                "name": name,
+                "enabled": enabled,
+                "manifest": text_manifest.relative_to(mods.root).as_posix(),
+                "manifestType": "mods.txt",
+                "enabledMarkerPresent": enabled_marker.is_file(),
+            },
             "actualChanges": changes,
-            "evidence": [{"kind": "artifact_hash", "source": manifest_path.as_posix(), "sha256": sha256_file(manifest_path)}],
+            "evidence": [{"kind": "artifact_hash", "source": text_manifest.as_posix(), "sha256": sha256_file(text_manifest)}],
             "restartRequired": True,
         }
 

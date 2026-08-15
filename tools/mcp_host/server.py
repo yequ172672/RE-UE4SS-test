@@ -22,12 +22,14 @@ from .mods import ModManager
 from .processes import ProcessManager
 from .runtime import PROTOCOL_VERSION, RuntimeClient
 from .scenarios import ScenarioRunner
+from .settings import SettingsManager
 from .tasks import TaskRegistry
 from .toolchains import Toolchains
 from .workspace import Workspace
 
 
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
+RUNTIME_SCOPED_HOST_TOOLS = frozenset({"ue4ss_tasks_list", "ue4ss_task_get", "ue4ss_task_cancel", "ue4ss_events_read"})
 
 
 class McpHostServer:
@@ -60,6 +62,7 @@ class McpHostServer:
             self._handle_dap_event,
         )
         self.mods = ModManager(self.workspace)
+        self.settings = SettingsManager(self.workspace)
         self.scenarios = ScenarioRunner(self.workspace, self.runtime)
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -219,6 +222,26 @@ class McpHostServer:
         try:
             if name not in self._host_tools:
                 return self.runtime.call_tool(name, arguments)
+            if name in RUNTIME_SCOPED_HOST_TOOLS:
+                scope = arguments.get("scope", "host")
+                if scope not in ("host", "runtime"):
+                    raise ToolError(
+                        "transport.invalid_arguments",
+                        "Argument 'scope' must be host or runtime",
+                        stage="transport.arguments",
+                        context={"argument": "scope"},
+                    )
+                if name in ("ue4ss_task_get", "ue4ss_task_cancel"):
+                    invalid_identifier = "operationId" if scope == "runtime" else "taskId"
+                    if invalid_identifier in arguments:
+                        raise ToolError(
+                            "transport.invalid_arguments",
+                            f"Argument '{invalid_identifier}' is not valid for {scope} scope",
+                            stage="transport.arguments",
+                            context={"argument": invalid_identifier, "scope": scope},
+                        )
+                if scope == "runtime":
+                    return self.runtime.call_tool(name, {key: value for key, value in arguments.items() if key != "scope"})
             outcome = self._call_host_tool(name, arguments)
             if self._is_operation(outcome):
                 operation = outcome
@@ -352,6 +375,20 @@ class McpHostServer:
                     self._integer(arguments, "waitMs", 0, 0, 30000) / 1000,
                 )
             }
+        if name == "ue4ss_settings_profile":
+            return self.settings.profile(
+                self._required_string(arguments, "root"),
+                self._required_string(arguments, "path"),
+                self._optional_string(arguments, "overridePath"),
+            )
+        if name == "ue4ss_settings_patch":
+            return self.settings.patch(
+                self._required_string(arguments, "root"),
+                self._required_string(arguments, "path"),
+                arguments.get("changes"),
+                self._required_string(arguments, "expectedSha256"),
+                self._optional_string(arguments, "overridePath"),
+            )
         if name == "ue4ss_files_list":
             return {"currentState": self.workspace.list(self._required_string(arguments, "root"), self._string(arguments, "path", ""), self._integer(arguments, "cursor", 0, 0, 2**63 - 1), self._integer(arguments, "limit", 200, 1, 1000), self._boolean(arguments, "recursive", False))}
         if name == "ue4ss_files_read":

@@ -2,8 +2,8 @@
 
 UE4SS provides two local Model Context Protocol (MCP) Streamable HTTP endpoints:
 
-- The embedded runtime endpoint runs inside the game process. It exposes the current UE4SS session, reflection, Lua, hooks, logs, and runtime debugging.
-- The optional host endpoint runs as a Python process. It adds scoped file operations, process lifecycle, explicit-PID memory tools, mod lifecycle, C++ builds, Unreal Editor automation, native debugging, tasks, and repeatable validation scenarios. It can proxy the embedded runtime tools through one client connection.
+- The embedded runtime endpoint runs inside the game process. It exposes the current UE4SS session, reflection search and watches, asset loading, built-in dumpers, Lua/mod control, hooks, logs, and runtime debugging.
+- The optional host endpoint runs as a Python process. It adds scoped UE4SS settings profiling and patching, file operations, process lifecycle, explicit-PID memory tools, mod lifecycle, C++ builds, Unreal Editor automation, native debugging, tasks, and repeatable validation scenarios. It can proxy the embedded runtime tools through one client connection.
 
 Both endpoints accept IPv4 loopback addresses only. They are disabled until explicitly configured and have not passed the separate security review required for remote or public exposure.
 
@@ -38,15 +38,19 @@ MCP: Listening at http://127.0.0.1:<port>/mcp (session <id>).
 
 The transport starts before Unreal discovery finishes. Health and protocol metadata remain available during slow or degraded startup. Tools that require the UE4SS event loop or game thread return `lifecycle.runtime_not_ready` until their executor is available.
 
+For a build, installation, smoke-test, host-test, reversible settings, and troubleshooting walkthrough, see [Testing AI MCP locally](../guides/testing-ai-mcp.md).
+
 ## Embedded runtime tools
 
 | Area | Tools and behavior |
 | --- | --- |
 | Session | `ue4ss_session_snapshot`, `ue4ss_capabilities`, `ue4ss_mods_list`, and `ue4ss_logs_read` report the real process, UE4SS/Unreal versions, World generation, mod state, capability evidence, and bounded log pages. |
-| Reflection | `ue4ss_objects_find`, `ue4ss_object_inspect`, and property read/write tools use session-, World-, index-, and serial-bound object handles. |
+| Reflection | `ue4ss_objects_query` combines literal or regular-expression name, full-name, path, class, outer, address, instance-kind, property-name, and property-type filters. `cursor` and `maxScanObjects` bound each game-thread scan; `nextCursor` continues an incomplete scan. Returned handles are bound to the session, World generation, object index, and serial number. |
+| Objects and assets | Inspect and property read/write tools use lifecycle-safe handles. Property watch tools sample on the game thread into bounded cursor histories. `ue4ss_asset_load` resolves and loads one exact asset registry object path and returns a handle. |
 | Calls | `ue4ss_console_execute` and `ue4ss_function_call` run on the UE4SS game-thread executor and return structured outputs. |
 | Hooks | Hook registration, removal, listing, and event reads expose bounded callback records with reflected parameter snapshots captured while ProcessEvent parameters remain valid. Client code never runs inside the native hook callback. |
-| Lua | `ue4ss_lua_execute`, `ue4ss_lua_mod_reload`, attach, breakpoint, status, control, error, and detach tools support evaluation and debugging in a named Lua mod state. |
+| Lua | `ue4ss_lua_execute`, `ue4ss_lua_mod_control`, reload, attach, breakpoint, status, control, error, and detach tools support evaluation, runtime lifecycle, and debugging in a named Lua mod state. Runtime lifecycle changes do not edit `mods.txt`. |
+| Dumpers | Profile and start tools expose the seven built-in object, C++ header, UHT header, Lua type, USMAP, actor, and static-mesh dumpers as observable asynchronous tasks with post-run file evidence. Cancellation is guaranteed only before a dumper enters its non-cooperative C++ body. |
 | Kismet | Profile, breakpoint, status, control, and removal tools use the loaded `KismetDebuggerMod` interface when its MCP interface version is compatible. |
 
 The endpoint also exposes session, capability, mod, and log resources. Logs and event streams use cursors instead of unbounded responses.
@@ -90,7 +94,8 @@ The command prints one JSON record containing its selected loopback endpoint and
 
 | Area | Behavior |
 | --- | --- |
-| Status and tasks | Host status, task list/get/cancel, and cursor-based events expose progress, recent output, completion, failure, and cancellation. |
+| Status and tasks | Host status, task list/get/cancel, and cursor-based events expose progress, recent output, completion, failure, and cancellation. These four colliding tool names default to `scope: "host"`; use `scope: "runtime"` with runtime task identifiers to inspect or cancel embedded dumper and wait tasks without losing the embedded result payload. |
+| Settings | `ue4ss_settings_profile` parses a bounded UTF-8 `UE4SS-settings.ini` plus an optional read-only override and reports hashes, effective values, and override provenance. `ue4ss_settings_patch` requires the profiled SHA-256, preserves unrelated text/comments/order/BOM/newlines, writes atomically, verifies readback, and reports `restartRequired: true`. |
 | Files and artifacts | Bounded list/read/search, atomic write, compare, move, guarded delete, backup/restore, and hashed manifests operate only under configured roots. |
 | Mods | Lua and C++ source creation, verified install, atomic enable/disable, and drift-checked removal support a clean mod lifecycle. Generated Lua mods use `Scripts/main.lua`; generated C++ mods install `dlls/main.dll`. |
 | C++ | `ue4ss_cpp_build` runs cancellable CMake configure/build/install operations and returns compiler diagnostics, process evidence, and bounded hashes for build or install artifacts. |
@@ -127,3 +132,4 @@ Host and runtime operation identifiers belong to different sessions. The host re
 - Runtime Kismet debugging requires a loaded, interface-compatible `KismetDebuggerMod`.
 - Raw memory tools require an explicit process ID, are bounded to the documented sizes, and currently report unavailable on unsupported hosts.
 - Compatibility is capability-specific. One failed probe does not disable unrelated tools.
+- Runtime object queries execute on the game thread. Keep `maxScanObjects` bounded and continue through `nextCursor` rather than requesting one unbounded full-object-array scan.

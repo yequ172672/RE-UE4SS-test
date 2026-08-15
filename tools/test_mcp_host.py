@@ -16,12 +16,42 @@ import urllib.request
 
 from tools.mcp_host.model import OperationStore, ToolError
 from tools.mcp_host.server import McpHostServer
+from tools.mcp_host.settings import SettingsManager
 from tools.mcp_host.tasks import TaskRegistry
 
+from tools.mcp_host.workspace import Workspace
 
 class FakeRuntime:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
+        runtime_task = {
+            "taskId": "runtime-test-task-1",
+            "taskType": "dumper",
+            "kind": "objects",
+            "status": "running",
+            "progress": 0.5,
+            "currentAction": "running objects dumper",
+            "actualChanges": [{"kind": "file", "path": "ObjectDump.txt"}],
+            "result": {"artifactCount": 1},
+        }
+        self.tool_results: dict[str, dict[str, object]] = {
+            "ue4ss_tasks_list": {"tasks": [runtime_task], "count": 1},
+            "ue4ss_task_get": runtime_task,
+            "ue4ss_task_cancel": {
+                **runtime_task,
+                "cancelRequested": True,
+                "cancellationAccepted": False,
+                "cancellationMessage": "The dumper entrance has begun and is non-cooperative; execution will continue",
+            },
+            "ue4ss_events_read": {
+                "events": [{"sequence": 7, "kind": "task.completed", "data": {"taskId": runtime_task["taskId"]}}],
+                "oldestCursor": 0,
+                "nextCursor": 7,
+                "newestSequence": 7,
+                "cursorExpired": False,
+                "truncated": False,
+            },
+        }
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -41,7 +71,9 @@ class FakeRuntime:
                 elif method == "tools/list":
                     result = {"tools": [{"name": "ue4ss_fake_runtime", "description": "Fake runtime tool", "inputSchema": {"type": "object"}}]}
                 elif method == "tools/call":
-                    result = {"content": [{"type": "text", "text": "runtime-ok"}], "structuredContent": {"runtime": True, "arguments": params["arguments"]}, "isError": False}
+                    tool_name = params["name"]
+                    structured = owner.tool_results.get(tool_name, {"runtime": True, "arguments": params["arguments"]})
+                    result = {"content": [{"type": "text", "text": json.dumps(structured)}], "structuredContent": structured, "isError": False}
                 elif method == "resources/list":
                     result = {"resources": [{"uri": "ue4ss://fake", "name": "Fake", "mimeType": "application/json"}]}
                 elif method == "resources/read":
@@ -228,6 +260,267 @@ while True:
         editor = self.call("ue4ss_editor_profile", {})
         self.assertFalse(editor["currentState"]["available"])
         self.assertTrue(editor["currentState"]["missingConditions"])
+
+    def test_scoped_task_and_event_schemas_distinguish_host_and_runtime(self) -> None:
+        tools = {tool["name"]: tool for tool in self.rpc("tools/list")["result"]["tools"]}
+        for name in ("ue4ss_tasks_list", "ue4ss_task_get", "ue4ss_task_cancel", "ue4ss_events_read"):
+            scope = tools[name]["inputSchema"]["properties"]["scope"]
+            self.assertEqual(scope, {"type": "string", "enum": ["host", "runtime"], "default": "host"})
+        for name in ("ue4ss_task_get", "ue4ss_task_cancel"):
+            schema = tools[name]["inputSchema"]
+            self.assertIn("operationId", schema["properties"])
+            self.assertIn("taskId", schema["properties"])
+            self.assertEqual(schema["then"]["required"], ["taskId"])
+            self.assertEqual(schema["then"]["not"]["required"], ["operationId"])
+            self.assertEqual(schema["else"]["required"], ["operationId"])
+            self.assertEqual(schema["else"]["not"]["required"], ["taskId"])
+
+    def test_runtime_scope_routes_all_colliding_tools_and_preserves_payloads(self) -> None:
+        calls = [
+            ("ue4ss_tasks_list", {"scope": "runtime"}),
+            ("ue4ss_task_get", {"scope": "runtime", "taskId": "runtime-test-task-1"}),
+            ("ue4ss_task_cancel", {"scope": "runtime", "taskId": "runtime-test-task-1"}),
+            ("ue4ss_events_read", {"scope": "runtime", "cursor": 3, "limit": 25}),
+        ]
+        for name, arguments in calls:
+            result = self.rpc("tools/call", {"name": name, "arguments": arguments})["result"]
+            expected = self.runtime.tool_results[name]
+            self.assertEqual(result["structuredContent"], expected)
+            self.assertEqual(json.loads(result["content"][0]["text"]), expected)
+            self.assertFalse(result["isError"])
+        proxied = [params for method, params in self.runtime.calls if method == "tools/call"]
+        self.assertEqual(
+            proxied,
+            [
+                {"name": "ue4ss_tasks_list", "arguments": {}},
+                {"name": "ue4ss_task_get", "arguments": {"taskId": "runtime-test-task-1"}},
+                {"name": "ue4ss_task_cancel", "arguments": {"taskId": "runtime-test-task-1"}},
+                {"name": "ue4ss_events_read", "arguments": {"cursor": 3, "limit": 25}},
+            ],
+        )
+
+    def test_default_scope_stays_on_host_and_runtime_unavailable_does_not_fallback(self) -> None:
+        waiting = self.call("ue4ss_scenario_run", {"scenario": {"name": "host-scope", "steps": [{"action": "wait", "seconds": 5}]}})
+        cancelled = self.call("ue4ss_task_cancel", {"operationId": waiting["operationId"]})
+        self.assertEqual(cancelled["operationId"], waiting["operationId"])
+        self.assertTrue(cancelled["cancellationRequested"])
+        listed = self.call("ue4ss_tasks_list", {})
+        self.assertTrue(any(operation["operationId"] == waiting["operationId"] for operation in listed["currentState"]["operations"]))
+        fetched = self.call("ue4ss_task_get", {"scope": "host", "operationId": waiting["operationId"]})
+        self.assertEqual(fetched["currentState"]["operationId"], waiting["operationId"])
+        events = self.call("ue4ss_events_read", {"cursor": 0, "limit": 1000})
+        self.assertGreater(len(events["currentState"]["events"]), 0)
+        self.assertFalse(any(method == "tools/call" for method, _ in self.runtime.calls))
+
+        self.host.runtime.endpoint = None
+        unavailable = self.rpc("tools/call", {"name": "ue4ss_tasks_list", "arguments": {"scope": "runtime"}})["result"]
+        self.assertTrue(unavailable["isError"])
+        self.assertEqual(unavailable["structuredContent"]["status"], "failed")
+        self.assertEqual(unavailable["structuredContent"]["errors"][0]["code"], "lifecycle.runtime_unavailable")
+        still_host = self.call("ue4ss_tasks_list", {})
+        self.assertEqual(still_host["status"], "succeeded")
+    def test_settings_profile_patch_preserves_layout_and_reports_override(self) -> None:
+        base_path = self.game / "UE4SS-settings.ini"
+        override_path = self.game / "UE4SS-settings.override.ini"
+        base_raw = (
+            b"\xef\xbb\xbf[MCP]\r\n"
+            b"; keep this whole-line comment\r\n"
+            b"Enabled = 0\r\n"
+            b"Port = 8182\r\n"
+            b"port = 7000\r\n"
+            b"\r\n"
+            b"[Other]\r\n"
+            b"Untouched=exact\r\n"
+        )
+        base_path.write_bytes(base_raw)
+        override_path.write_text("[MCP]\nPort = 9000\n", encoding="utf-8")
+
+        profile = self.call(
+            "ue4ss_settings_profile",
+            {"root": "game", "path": base_path.name, "overridePath": override_path.name},
+        )
+        state = profile["currentState"]
+        self.assertTrue(state["baseHasUtf8Bom"])
+        self.assertEqual(state["baseSections"]["MCP"]["Port"], "8182")
+        self.assertEqual(state["baseSections"]["MCP"]["port"], "7000")
+        self.assertEqual(state["effectiveSections"]["MCP"]["Port"], "9000")
+        self.assertEqual(state["overrideSources"][0]["sourcePath"], override_path.name)
+
+        patched = self.call(
+            "ue4ss_settings_patch",
+            {
+                "root": "game",
+                "path": base_path.name,
+                "overridePath": override_path.name,
+                "expectedSha256": state["baseSha256"],
+                "changes": [
+                    {"section": "MCP", "key": "Enabled", "value": True},
+                    {"section": "MCP", "key": "Port", "value": 8183},
+                    {"section": "MCP", "key": "NewKey", "value": 7},
+                    {"section": "Added", "key": "Value", "value": "text"},
+                ],
+            },
+        )
+        self.assertEqual(patched["status"], "succeeded")
+        self.assertTrue(patched["restartRequired"])
+        self.assertTrue(patched["currentState"]["verified"])
+        changes = {(item["section"], item["key"]): item for item in patched["actualChanges"]}
+        self.assertEqual(changes[("MCP", "Enabled")]["before"], "0")
+        self.assertEqual(changes[("MCP", "Enabled")]["after"], "true")
+        self.assertTrue(changes[("MCP", "Port")]["shadowedByOverride"])
+        self.assertEqual(changes[("MCP", "Port")]["effectiveValue"], "9000")
+        written = base_path.read_bytes()
+        self.assertTrue(written.startswith(b"\xef\xbb\xbf"))
+        self.assertIn(b"; keep this whole-line comment\r\nEnabled = true\r\n", written)
+        self.assertIn(b"[Other]\r\nUntouched=exact\r\n", written)
+        self.assertNotIn(b"\n", written.replace(b"\r\n", b""))
+        self.assertEqual(override_path.read_text(encoding="utf-8"), "[MCP]\nPort = 9000\n")
+
+        conflict = self.call(
+            "ue4ss_settings_patch",
+            {
+                "root": "game",
+                "path": base_path.name,
+                "expectedSha256": state["baseSha256"],
+                "changes": [{"section": "MCP", "key": "Enabled", "value": False}],
+            },
+        )
+        self.assertEqual(conflict["status"], "rejected")
+        self.assertEqual(conflict["errors"][0]["code"], "artifact.conflict")
+
+        invalid_section = self.call(
+            "ue4ss_settings_patch",
+            {
+                "root": "game",
+                "path": base_path.name,
+                "expectedSha256": patched["currentState"]["baseSha256"],
+                "changes": [{"section": "MCP=Bad", "key": "Enabled", "value": True}],
+            },
+        )
+        self.assertEqual(invalid_section["status"], "rejected")
+        self.assertEqual(invalid_section["errors"][0]["code"], "settings.invalid_change")
+        invalid_key = self.call(
+            "ue4ss_settings_patch",
+            {
+                "root": "game",
+                "path": base_path.name,
+                "expectedSha256": patched["currentState"]["baseSha256"],
+                "changes": [{"section": "MCP", "key": "Bad;Key", "value": True}],
+            },
+        )
+        self.assertEqual(invalid_key["status"], "rejected")
+        self.assertEqual(invalid_key["errors"][0]["code"], "settings.invalid_change")
+        self.assertEqual(base_path.read_bytes(), written)
+
+
+    def test_settings_parser_matches_native_whitespace_comments_and_insertion_order(self) -> None:
+        exact_path = self.game / "exact-settings.ini"
+        exact_path.write_text("[ MCP ]\nPort = 8182   \n\tTabbed=9\n", encoding="utf-8")
+        exact_profile = self.call("ue4ss_settings_profile", {"root": "game", "path": exact_path.name})
+        exact_state = exact_profile["currentState"]
+        self.assertEqual(exact_state["baseSections"][" MCP "]["Port"], "8182   ")
+        self.assertEqual(exact_state["baseSections"][" MCP "]["\tTabbed"], "9")
+
+        exact_patch = self.call(
+            "ue4ss_settings_patch",
+            {
+                "root": "game",
+                "path": exact_path.name,
+                "expectedSha256": exact_state["baseSha256"],
+                "changes": [
+                    {"section": " MCP ", "key": "Port", "value": 8183},
+                    {"section": " MCP ", "key": "\tTabbed", "value": 10},
+                ],
+            },
+        )
+        self.assertEqual(exact_patch["status"], "succeeded")
+        self.assertEqual(exact_path.read_text(encoding="utf-8"), "[ MCP ]\nPort = 8183\n\tTabbed=10\n")
+        self.assertNotIn("MCP", exact_patch["currentState"]["baseSections"])
+
+        mixed_path = self.game / "mixed-insertions.ini"
+        mixed_path.write_text("[MCP]\nExisting=1\n", encoding="utf-8")
+        mixed_profile = self.call("ue4ss_settings_profile", {"root": "game", "path": mixed_path.name})
+        mixed_patch = self.call(
+            "ue4ss_settings_patch",
+            {
+                "root": "game",
+                "path": mixed_path.name,
+                "expectedSha256": mixed_profile["currentState"]["baseSha256"],
+                "changes": [
+                    {"section": "New", "key": "Value", "value": 3},
+                    {"section": "MCP", "key": "Added", "value": 2},
+                ],
+            },
+        )
+        self.assertEqual(mixed_patch["status"], "succeeded")
+        self.assertEqual(mixed_patch["currentState"]["baseSections"]["MCP"]["Added"], "2")
+        self.assertEqual(mixed_patch["currentState"]["baseSections"]["New"]["Value"], "3")
+        self.assertLess(mixed_path.read_text(encoding="utf-8").index("Added = 2"), mixed_path.read_text(encoding="utf-8").index("[New]"))
+
+        for name, text in (
+            ("hash-comment.ini", "[MCP]\n# comment\nPort=8182\n"),
+            ("header-comment.ini", "[MCP] ; comment\nPort=8182\n"),
+        ):
+            invalid_path = self.game / name
+            invalid_path.write_text(text, encoding="utf-8")
+            invalid = self.call("ue4ss_settings_profile", {"root": "game", "path": invalid_path.name})
+            self.assertEqual(invalid["status"], "failed")
+            self.assertEqual(invalid["errors"][0]["code"], "settings.parse_error")
+
+    def test_settings_hash_guard_is_serialized_across_managers(self) -> None:
+        path = self.game / "UE4SS-settings.ini"
+        path.write_text("[MCP]\nPort = 8182\n", encoding="utf-8")
+        profile = self.host.settings.profile("game", path.name)
+        expected_hash = profile["currentState"]["baseSha256"]
+        other_workspace = Workspace({"game": self.game}, Path(self.temporary.name) / "other-state")
+        other_manager = SettingsManager(other_workspace)
+        entered_replace = threading.Event()
+        release_replace = threading.Event()
+        outcomes: dict[str, object] = {}
+        original_replace = self.host.settings._atomic_replace
+
+        def delayed_replace(target: Path, data: bytes) -> None:
+            entered_replace.set()
+            self.assertTrue(release_replace.wait(timeout=5))
+            original_replace(target, data)
+
+        def first_patch() -> None:
+            outcomes["first"] = self.host.settings.patch(
+                "game",
+                path.name,
+                [{"section": "MCP", "key": "Port", "value": 8183}],
+                expected_hash,
+            )
+
+        def second_patch() -> None:
+            try:
+                outcomes["second"] = other_manager.patch(
+                    "game",
+                    path.name,
+                    [{"section": "MCP", "key": "Port", "value": 8184}],
+                    expected_hash,
+                )
+            except ToolError as error:
+                outcomes["secondError"] = error
+
+        with mock.patch.object(self.host.settings, "_atomic_replace", side_effect=delayed_replace):
+            first = threading.Thread(target=first_patch)
+            second = threading.Thread(target=second_patch)
+            first.start()
+            self.assertTrue(entered_replace.wait(timeout=5))
+            second.start()
+            time.sleep(0.1)
+            self.assertTrue(second.is_alive())
+            release_replace.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertIn("first", outcomes)
+        self.assertNotIn("second", outcomes)
+        self.assertEqual(outcomes["secondError"].code, "artifact.conflict")
+        self.assertEqual(path.read_text(encoding="utf-8"), "[MCP]\nPort = 8183\n")
 
     def test_memory_capability_is_stable_off_windows(self) -> None:
         profile = self.call("ue4ss_memory_profile", {})
@@ -639,6 +932,29 @@ while True:
         self.assertTrue((self.game / "Mods" / "HelloMcp").is_dir())
         removed = self.call("ue4ss_mod_remove", {"root": "game", "modsPath": "Mods", "name": "HelloMcp"})
         self.assertEqual(removed["currentState"]["installed"], False)
+
+    def test_mod_enable_creates_runtime_manifest_and_updates_duplicate_entries(self) -> None:
+        mods = self.game / "Mods"
+        mods.mkdir(parents=True, exist_ok=True)
+        created = self.call("ue4ss_mod_set_enabled", {"root": "game", "modsPath": "Mods", "name": "HelloMcp", "enabled": True})
+        self.assertEqual(created["currentState"]["manifest"], "Mods/mods.txt")
+        self.assertFalse((mods / "mods.json").exists())
+
+        (mods / "mods.txt").write_text("HelloMcp : 1\nHelloMcp : 1\n", encoding="utf-8")
+        disabled = self.call("ue4ss_mod_set_enabled", {"root": "game", "modsPath": "Mods", "name": "HelloMcp", "enabled": False})
+        self.assertEqual(disabled["currentState"]["enabled"], False)
+        self.assertEqual((mods / "mods.txt").read_text(encoding="utf-8").count("HelloMcp : 0"), 2)
+
+    def test_mod_disable_rejects_enabled_marker_override(self) -> None:
+        mod = self.game / "Mods" / "HelloMcp"
+        mod.mkdir(parents=True, exist_ok=True)
+        (self.game / "Mods" / "mods.txt").write_text("HelloMcp : 1\n", encoding="utf-8")
+        (mod / "enabled.txt").write_text("", encoding="utf-8")
+
+        result = self.call("ue4ss_mod_set_enabled", {"root": "game", "modsPath": "Mods", "name": "HelloMcp", "enabled": False})
+
+        self.assertEqual(result["errors"][0]["code"], "mod.enabled_marker_conflict")
+        self.assertEqual((self.game / "Mods" / "mods.txt").read_text(encoding="utf-8"), "HelloMcp : 1\n")
 
     def test_native_debug_dap_round_trip(self) -> None:
         profile = self.call("ue4ss_native_debug_profile", {})

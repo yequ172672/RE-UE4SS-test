@@ -2028,6 +2028,12 @@ namespace RC
         new_mod_ptr->set_installed(true);
 
         new_mod_ptr->start_mod();
+        if (!new_mod_ptr->is_started())
+        {
+            Output::send<LogLevel::Error>(STR("Mod '{}' failed to start during reinstall\n"), new_mod_ptr->get_name());
+            queue_uninstall_mod(new_mod_ptr);
+            return;
+        }
 
         Output::send(STR("Mod '{}' reinstalled\n"), new_mod_ptr->get_name());
     }
@@ -2199,9 +2205,9 @@ namespace RC
                 }
                 else
                 {
-                    // Mod exists but is not started - remove it first (its Lua state is invalid)
-                    // Then we'll create a fresh one below
-                    delete_mod(lua_mod);
+                    // A failed start can leave callbacks and key bindings registered.
+                    // Run the complete uninstall path before destroying the invalid Lua state.
+                    queue_uninstall_mod(lua_mod);
                     break;
                 }
             }
@@ -2223,8 +2229,15 @@ namespace RC
         auto new_mod = std::make_unique<LuaMod>(*this, std::move(mod_name), std::filesystem::path(mod_path));
         LuaMod* new_mod_ptr = new_mod.get();
         m_mods.emplace_back(std::move(new_mod));
+        new_mod_ptr->set_installed(true);
 
         new_mod_ptr->start_mod();
+        if (!new_mod_ptr->is_started())
+        {
+            Output::send<LogLevel::Error>(STR("Mod '{}' failed to start\n"), new_mod_ptr->get_name());
+            queue_uninstall_mod(new_mod_ptr);
+            return;
+        }
 
         Output::send(STR("Mod '{}' started\n"), new_mod_ptr->get_name());
     }

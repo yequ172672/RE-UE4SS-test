@@ -19,12 +19,14 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <utility>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include <winsock2.h>
@@ -33,17 +35,22 @@
 
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <GUI/LuaDebugger.hpp>
+#include <GUI/Dumpers.hpp>
 #include <Helpers/String.hpp>
 #include <Mod/CppMod.hpp>
 #include <Mod/LuaMod.hpp>
 #include <UE4SSRuntime.hpp>
+#include <USMapGenerator/Generator.hpp>
 #include <UE4SSProgram.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Unreal/CoreUObject/UObject/Class.hpp>
 #include <Unreal/Hooks/Hooks.hpp>
 #include <Unreal/UObject.hpp>
+#include <Unreal/UPackage.hpp>
 #include <Unreal/UObjectArray.hpp>
 #include <Unreal/FWeakObjectPtr.hpp>
+#include <Unreal/UAssetRegistry.hpp>
+#include <Unreal/UAssetRegistryHelpers.hpp>
 #include <Unreal/World.hpp>
 #include <Unreal/UGameViewportClient.hpp>
 #include <Unreal/UObjectGlobals.hpp>
@@ -174,6 +181,20 @@ namespace RC::Mcp
             return member->get<std::string>();
         }
 
+        auto optional_boolean(const Json& value, std::string_view name, bool fallback) -> bool
+        {
+            const auto* member = find_member(value, name);
+            if (!member)
+            {
+                return fallback;
+            }
+            if (!member->is_boolean())
+            {
+                throw McpError{"transport.invalid_arguments", fmt::format("Argument '{}' must be a boolean", name)};
+            }
+            return member->get<bool>();
+        }
+
         auto optional_integer(const Json& value, std::string_view name, int64_t fallback) -> int64_t
         {
             const auto* member = find_member(value, name);
@@ -249,6 +270,65 @@ namespace RC::Mcp
             return value;
         }
 
+        class BoundedOutputCapture final : public Unreal::FOutputDevice
+        {
+          public:
+            explicit BoundedOutputCapture(size_t maximum_bytes) : m_maximum_bytes(maximum_bytes)
+            {
+                bSuppressEventTag = false;
+                bAutoEmitLineTerminator = true;
+            }
+
+            void Virtual_Serialize(const TCHAR* value, Unreal::ELogVerbosity::Type, const Unreal::FName&) override
+            {
+                append(value);
+            }
+
+            void Virtual_Serialize(const TCHAR* value, Unreal::ELogVerbosity::Type, const Unreal::FName&, double) override
+            {
+                append(value);
+            }
+
+            [[nodiscard]] auto output() const -> const std::string&
+            {
+                return m_output;
+            }
+
+            [[nodiscard]] auto truncated() const -> bool
+            {
+                return m_truncated;
+            }
+
+          private:
+            void append(const TCHAR* value)
+            {
+                if (!value)
+                {
+                    return;
+                }
+                const auto text = to_string(StringType{value});
+                const auto remaining = m_maximum_bytes - m_output.size();
+                if (text.size() > remaining)
+                {
+                    auto valid_prefix = remaining;
+                    while (valid_prefix > 0 && (static_cast<unsigned char>(text[valid_prefix]) & 0xC0U) == 0x80U)
+                    {
+                        --valid_prefix;
+                    }
+                    m_output.append(text.data(), valid_prefix);
+                    m_truncated = true;
+                }
+                else
+                {
+                    m_output.append(text);
+                }
+            }
+
+            size_t m_maximum_bytes{};
+            std::string m_output{};
+            bool m_truncated{};
+        };
+
         auto trim(std::string_view value) -> std::string_view
         {
             while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
@@ -293,14 +373,22 @@ namespace RC::Mcp
       "annotations": {"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
     },
     {
-      "name": "ue4ss_objects_find",
-      "description": "Find live UObject instances by reflected class name and return bounded results with path, address and lifecycle-safe session/index/serial handles. Read-only but may briefly scan runtime objects. Requires initialized GUObjectArray and the UE4SS event loop.",
-      "inputSchema": {"type":"object","required":["className"],"properties":{"className":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":500}},"additionalProperties":false},
+      "name": "ue4ss_objects_query",
+      "description": "Query live UObjects with bounded, conjunctive filters and return lifecycle-safe session/world/index/serial handles without retaining UObject pointers. Literal text filters use substring matching; regex uses ECMAScript search; outer matches the outer path; hasProperties and propertyTypes require every listed value. cursor and maxScanObjects bound one game-thread scan page; nextCursor continues an incomplete page. Requires initialized GUObjectArray and at least one effective filter; malformed filters fail before scanning.",
+      "inputSchema": {"type":"object","properties":{"name":{"type":"string","minLength":1},"fullName":{"type":"string","minLength":1},"path":{"type":"string","minLength":1},"className":{"type":"string","minLength":1},"outer":{"type":"string","minLength":1},"address":{"type":"string","minLength":1},"regex":{"type":"boolean"},"caseSensitive":{"type":"boolean"},"includeDerived":{"type":"boolean"},"instanceMode":{"type":"string","enum":["any","instances","nonInstances","classDefaultObjects"]},"hasProperties":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1}},"propertyTypes":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1}},"cursor":{"type":"integer","minimum":0},"maxScanObjects":{"type":"integer","minimum":1,"maximum":200000},"limit":{"type":"integer","minimum":1,"maximum":500}},"additionalProperties":false},
       "annotations": {"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
     },
     {
+      "name": "ue4ss_asset_load",
+      "description": "Resolve exactly one Unreal asset registry object path and load that asset on the game thread. Returns lifecycle-safe session/world/index/serial identity for subsequent inspect/read operations and never retains a raw UObject pointer. Side effect: the asset/package may become resident. Requires DevelopmentMode=1, the UEngine::Tick game-thread callback, GUObjectArray and AssetRegistry; failures distinguish thread.unavailable, asset.registry_unavailable, asset.not_found and asset.load_failed.",
+      "inputSchema": {"type":"object","required":["objectPath"],"properties":{"objectPath":{"type":"string","minLength":1}},"additionalProperties":false},
+      "annotations": {"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}
+    },
+)json";
+                result += R"json(
+    {
       "name": "ue4ss_console_execute",
-      "description": "Execute an Unreal console command through the current GameViewportClient on the game thread. Returns whether Unreal handled the command; textual command output remains available through ue4ss_logs_read. Requires DevelopmentMode=1, a live viewport and the UE4SS event loop.",
+      "description": "Execute an Unreal console command through the current GameViewportClient on the game thread. Captures at most 65536 bytes written by ProcessConsoleExec itself and separately reports UE4SS.log byte cursors before/after; the log is not presented as command output. Side effects depend on the command. Requires DevelopmentMode=1, a live viewport and the UEngine::Tick game-thread callback; capture truncation is explicit.",
       "inputSchema": {"type":"object","required":["command"],"properties":{"command":{"type":"string","minLength":1}},"additionalProperties":false},
       "annotations": {"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}
     },
@@ -341,6 +429,30 @@ namespace RC::Mcp
       "annotations": {"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
     },
     {
+      "name": "ue4ss_property_watch_start",
+      "description": "Start bounded game-thread sampling of one reflected property identified only by a lifecycle-safe object handle and property name. Records the initial ExportText value, then changed values unless emitUnchanged is true. Requires a live handle, reflected property, initialized UEngine::Tick callback, and historyLimit from 1 to 1000; side effects are an in-memory observer and bounded history.",
+      "inputSchema": {"type":"object","required":["handle","propertyName","historyLimit"],"properties":{"handle":{"type":"string","minLength":1},"propertyName":{"type":"string","minLength":1},"historyLimit":{"type":"integer","minimum":1,"maximum":1000},"emitUnchanged":{"type":"boolean","default":false}},"additionalProperties":false},
+      "annotations": {"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}
+    },
+    {
+      "name": "ue4ss_property_watches_list",
+      "description": "List active and stopped property watches with bounded-history cursors. Read-only and thread-safe; requires this MCP server session.",
+      "inputSchema": {"type":"object","properties":{},"additionalProperties":false},
+      "annotations": {"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
+    },
+    {
+      "name": "ue4ss_property_watch_read",
+      "description": "Read a bounded page of value or expired events for one property watch by sequence cursor. Reports cursorExpired when bounded history overwrote unread events and truncated when more events remain. Read-only; requires a watchId from this MCP server session.",
+      "inputSchema": {"type":"object","required":["watchId"],"properties":{"watchId":{"type":"string","minLength":1},"cursor":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"additionalProperties":false},
+      "annotations": {"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
+    },
+    {
+      "name": "ue4ss_property_watch_stop",
+      "description": "Idempotently stop future sampling for one property watch while retaining its bounded history for reads. Requires a watchId string; side effect is disabling that in-memory observer.",
+      "inputSchema": {"type":"object","required":["watchId"],"properties":{"watchId":{"type":"string","minLength":1}},"additionalProperties":false},
+      "annotations": {"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
+    },
+    {
       "name": "ue4ss_property_write",
       "description": "Resolve an object handle, import a text value through the reflected FProperty, and read it back on the game thread. Requires DevelopmentMode=1; invalid Unreal text is rejected.",
       "inputSchema": {"type":"object","required":["handle","propertyName","value"],"properties":{"handle":{"type":"string","minLength":1},"propertyName":{"type":"string","minLength":1},"value":{"type":"string"}},"additionalProperties":false},
@@ -352,6 +464,8 @@ namespace RC::Mcp
       "inputSchema": {"type":"object","required":["handle","functionName"],"properties":{"handle":{"type":"string","minLength":1},"functionName":{"type":"string","minLength":1},"arguments":{"type":"object","additionalProperties":{"type":"string"}}},"additionalProperties":false},
       "annotations": {"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}
     },
+)json";
+                result += R"json(
     {
       "name": "ue4ss_lua_execute",
       "description": "Execute arbitrary Lua code inside a named started Lua mod and return primitive result values or a traceback. Side effects are unrestricted in development mode. Requires DevelopmentMode=1, a started Lua mod and the UE4SS event loop; common failures are syntax/runtime errors or a missing mod.",
@@ -362,6 +476,12 @@ namespace RC::Mcp
       "name": "ue4ss_lua_mod_reload",
       "description": "Uninstall and reinstall a named Lua mod, then report its actual started state. Side effects include callback/Hook teardown and entry-script execution. Requires DevelopmentMode=1 and an installed Lua mod; C++ mods are rejected because safe hot unload is unavailable.",
       "inputSchema": {"type":"object","required":["modName"],"properties":{"modName":{"type":"string","minLength":1}},"additionalProperties":false},
+      "annotations": {"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}
+    },
+    {
+      "name": "ue4ss_lua_mod_control",
+      "description": "Start, stop or restart one Lua mod on the UE4SS event-loop thread and return its post-action installed/started state. Stop remembers the runtime path before uninstall; start recreates a stopped/uninstalled Lua mod from that known path; restart uses the existing reinstall path. Side effects include Lua state, callback and Hook teardown/creation and entry-script execution. Requires DevelopmentMode=1 and the event loop. This never edits mods.txt (persisted=false); C++ mods fail with mod.cpp_restart_required because hot unload is unsafe.",
+      "inputSchema": {"type":"object","required":["name","action"],"properties":{"name":{"type":"string","minLength":1},"action":{"type":"string","enum":["start","stop","restart"]}},"additionalProperties":false},
       "annotations": {"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}
     },
     {
@@ -451,6 +571,18 @@ namespace RC::Mcp
       "annotations": {"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}
     },
     {
+      "name": "ue4ss_dumper_profile",
+      "description": "Report availability, output locations, executor and cancellation limits for the seven built-in UE4SS dumpers. Read-only. Availability requires an initialized Unreal runtime and a live UE4SS event loop; actors and staticMeshes additionally require a loaded World.",
+      "inputSchema": {"type":"object","properties":{},"additionalProperties":false},
+      "annotations": {"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
+    },
+    {
+      "name": "ue4ss_dumper_start",
+      "description": "Start exactly one built-in C++ dumper on the UE4SS event loop and return immediately with an AsyncTask. Requires DevelopmentMode=1, initialized Unreal runtime and a live UE4SS event loop. Side effects create or overwrite files below the UE4SS working directory and some generators may load assets. Cancellation is honored only before the dumper entrance begins; running dumpers are non-cooperative.",
+      "inputSchema": {"type":"object","required":["kind"],"properties":{"kind":{"type":"string","enum":["objects","cxxHeaders","uhtHeaders","luaTypes","usmap","actors","staticMeshes"]}},"additionalProperties":false},
+      "annotations": {"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}
+    },
+    {
       "name": "ue4ss_kismet_debug_profile",
       "description": "Report whether the loaded KismetDebuggerMod exposes the versioned MCP debugger interface and whether opcode interception is enabled.",
       "inputSchema": {"type":"object","properties":{},"additionalProperties":false},
@@ -514,9 +646,31 @@ namespace RC::Mcp
         {
             mutable std::mutex mutex;
             std::atomic_bool cancel_requested{false};
+            std::shared_ptr<std::atomic<PendingState>> execution_state{};
             Json state{json_object()};
             std::jthread worker{};
         };
+
+        struct PropertyWatch
+        {
+            std::string id;
+            std::string handle;
+            std::string property_name;
+            size_t history_limit{};
+            bool emit_unchanged{};
+            bool active{true};
+            bool expired{};
+            uint64_t next_sequence{1};
+            std::optional<std::string> last_value{};
+            std::deque<Json> history{};
+        };
+        struct DumperFileState
+        {
+            uintmax_t size{};
+            int64_t modified_time_milliseconds{};
+        };
+
+        using DumperFileSnapshot = std::unordered_map<std::string, DumperFileState>;
 
       public:
         Impl(UE4SSProgram& program, std::string bind_address, uint16_t port, int64_t operation_timeout_ms, bool development_mode)
@@ -638,6 +792,12 @@ namespace RC::Mcp
             if (!m_running.exchange(false) && m_listen_socket.load() == INVALID_SOCKET && !m_winsock_initialized)
             {
                 return;
+            }
+            {
+                std::lock_guard lock{m_property_watches_mutex};
+                m_property_watches.clear();
+                m_property_watch_order.clear();
+                m_property_watch_rotation = 0;
             }
             {
                 std::lock_guard lock{m_request_mutex};
@@ -1086,12 +1246,10 @@ namespace RC::Mcp
                 {
                     data = read_log(arguments);
                 }
-                else if (name == "ue4ss_objects_find")
+                else if (name == "ue4ss_objects_query")
                 {
-                    const auto class_name = required_string(arguments, "className");
-                    const auto limit = std::clamp<int64_t>(optional_integer(arguments, "limit", 100), 1, 500);
-                    data = run_on_game_thread([this, class_name, limit] {
-                        return find_objects(class_name, static_cast<size_t>(limit));
+                    data = run_on_game_thread([this, arguments] {
+                        return query_objects(arguments);
                     });
                 }
                 else if (name == "ue4ss_object_inspect")
@@ -1109,6 +1267,28 @@ namespace RC::Mcp
                     data = run_on_game_thread([this, handle, property_name] {
                         return read_property(handle, property_name);
                     });
+                }
+                else if (name == "ue4ss_property_watch_start")
+                {
+                    const auto handle = required_string(arguments, "handle");
+                    const auto property_name = required_string(arguments, "propertyName");
+                    const auto history_limit = required_integer(arguments, "historyLimit", 1, 1000);
+                    const auto emit_unchanged = optional_boolean(arguments, "emitUnchanged", false);
+                    data = run_on_game_thread([this, handle, property_name, history_limit, emit_unchanged] {
+                        return start_property_watch(handle, property_name, static_cast<size_t>(history_limit), emit_unchanged);
+                    });
+                }
+                else if (name == "ue4ss_property_watches_list")
+                {
+                    data = property_watches_snapshot();
+                }
+                else if (name == "ue4ss_property_watch_read")
+                {
+                    data = read_property_watch(arguments);
+                }
+                else if (name == "ue4ss_property_watch_stop")
+                {
+                    data = stop_property_watch(required_string(arguments, "watchId"));
                 }
                 else if (name == "ue4ss_property_write")
                 {
@@ -1133,6 +1313,14 @@ namespace RC::Mcp
                     }
                     data = run_on_game_thread([this, handle, function_name, values] {
                         return call_function(handle, function_name, values);
+                    });
+                }
+                else if (name == "ue4ss_asset_load")
+                {
+                    require_development_mode(name);
+                    const auto object_path = required_string(arguments, "objectPath");
+                    data = run_on_game_thread([this, object_path] {
+                        return load_asset(object_path);
                     });
                 }
                 else if (name == "ue4ss_console_execute")
@@ -1167,6 +1355,19 @@ namespace RC::Mcp
                     const auto code = required_string(arguments, "code");
                     data = run_on_event_loop([this, mod_name, code] {
                         return execute_lua(mod_name, code);
+                    });
+                }
+                else if (name == "ue4ss_lua_mod_control")
+                {
+                    require_development_mode(name);
+                    const auto mod_name = required_string(arguments, "name");
+                    const auto action = required_string(arguments, "action");
+                    if (action != "start" && action != "stop" && action != "restart")
+                    {
+                        throw McpError{"transport.invalid_arguments", "Argument 'action' must be 'start', 'stop' or 'restart'"};
+                    }
+                    data = run_on_event_loop([this, mod_name, action] {
+                        return control_lua_mod(mod_name, action);
                     });
                 }
                 else if (name == "ue4ss_lua_mod_reload")
@@ -1253,6 +1454,18 @@ namespace RC::Mcp
                 {
                     data = start_wait_task(arguments);
                 }
+                else if (name == "ue4ss_dumper_profile")
+                {
+                    data = m_program.can_process_events() ? run_on_event_loop([this] {
+                        return dumper_profile();
+                    })
+                                                          : dumper_profile();
+                }
+                else if (name == "ue4ss_dumper_start")
+                {
+                    require_development_mode(name);
+                    data = start_dumper_task(required_string(arguments, "kind"));
+                }
                 else if (name == "ue4ss_kismet_debug_profile")
                 {
                     data = kismet_debug_profile();
@@ -1298,7 +1511,8 @@ namespace RC::Mcp
                 {
                     throw McpError{"transport.tool_not_found", fmt::format("Unknown tool '{}'", name)};
                 }
-                return tool_result(name, "succeeded", std::move(data), std::nullopt);
+                const auto status = name == "ue4ss_wait_start" || name == "ue4ss_dumper_start" ? "accepted" : "succeeded";
+                return tool_result(name, status, std::move(data), std::nullopt);
             }
             catch (const McpError& error)
             {
@@ -1328,13 +1542,15 @@ namespace RC::Mcp
             readback_evidence["kind"] = "runtime_readback";
             readback_evidence["source"] = target;
             operation["evidence"] = JsonArray{std::move(readback_evidence)};
-            if (status == "succeeded" &&
-                (target == "ue4ss_lua_execute" || target == "ue4ss_lua_mod_reload" || target == "ue4ss_console_execute" || target == "ue4ss_hook_register" ||
-                 target == "ue4ss_hook_unregister" || target == "ue4ss_property_write" || target == "ue4ss_function_call"))
+            if (status == "succeeded" && (target == "ue4ss_lua_execute" || target == "ue4ss_lua_mod_reload" || target == "ue4ss_lua_mod_control" ||
+                                          target == "ue4ss_asset_load" || target == "ue4ss_console_execute" || target == "ue4ss_hook_register" ||
+                                          target == "ue4ss_hook_unregister" || target == "ue4ss_property_write" || target == "ue4ss_function_call"))
             {
                 Json change = json_object();
                 change["kind"] = target == "ue4ss_lua_execute"       ? "lua_execution"
                                  : target == "ue4ss_lua_mod_reload"  ? "lua_mod_reload"
+                                 : target == "ue4ss_lua_mod_control" ? "lua_mod_control"
+                                 : target == "ue4ss_asset_load"      ? "asset_load"
                                  : target == "ue4ss_console_execute" ? "console_execution"
                                  : target == "ue4ss_hook_register"   ? "hook_registration"
                                  : target == "ue4ss_hook_unregister" ? "hook_unregistration"
@@ -1343,7 +1559,11 @@ namespace RC::Mcp
                 change["applied"] = true;
                 operation["actualChanges"].get<JsonArray>().emplace_back(std::move(change));
             }
-            operation["restartRequired"] = false;
+            operation["restartRequired"] = error && error->first == "mod.cpp_restart_required";
+            if (target == "ue4ss_lua_mod_control")
+            {
+                operation["persisted"] = false;
+            }
             operation["errors"] = JsonArray{};
             operation["suggestedActions"] = JsonArray{};
             if (error)
@@ -1507,7 +1727,23 @@ namespace RC::Mcp
             }
             task->cancel_requested.store(true);
             task->worker.request_stop();
-            return copy_task_state(task);
+            bool cancellation_accepted = true;
+            bool non_cooperative = false;
+            if (task->execution_state)
+            {
+                auto queued = PendingState::Queued;
+                cancellation_accepted = task->execution_state->compare_exchange_strong(queued, PendingState::Cancelled);
+                non_cooperative = !cancellation_accepted && task->execution_state->load() == PendingState::Running;
+            }
+            {
+                std::lock_guard lock{task->mutex};
+                task->state["cancelRequested"] = true;
+                task->state["cancellationAccepted"] = cancellation_accepted;
+                task->state["cancellationMessage"] = cancellation_accepted ? "Cancellation was accepted before execution began"
+                                                     : non_cooperative     ? "The dumper entrance has begun and is non-cooperative; execution will continue"
+                                                                           : "The task has already completed";
+                return task->state;
+            }
         }
 
         auto start_wait_task(const Json& arguments) -> Json
@@ -1598,6 +1834,453 @@ namespace RC::Mcp
                 completed["status"] = final_status;
                 append_event("task.completed", std::move(completed));
             }};
+            return copy_task_state(task);
+        }
+
+        auto dumper_working_directory() const -> std::filesystem::path
+        {
+            return std::filesystem::path{m_program.get_working_directory()};
+        }
+
+        auto dumper_relative_output(const std::filesystem::path& output) const -> std::string
+        {
+            const auto relative = output.lexically_relative(dumper_working_directory());
+            if (!relative.empty() && *relative.begin() != "..")
+            {
+                return relative.generic_string();
+            }
+            return output.generic_string();
+        }
+
+        auto dumper_profile() const -> Json
+        {
+            const auto working_directory = dumper_working_directory();
+            const bool runtime_initialized = Unreal::UnrealInitializer::StaticStorage::bIsInitialized;
+            const bool event_loop_available = m_program.can_process_events();
+            const bool available = m_development_mode && runtime_initialized && event_loop_available;
+            bool world_available = false;
+            if (runtime_initialized && event_loop_available)
+            {
+                try
+                {
+                    auto* viewport_object = Unreal::UObjectGlobals::FindFirstOf(std::string_view{"GameViewportClient"});
+                    auto* viewport = static_cast<Unreal::UGameViewportClient*>(viewport_object);
+                    auto* world = viewport ? viewport->GetWorld() : nullptr;
+                    world_available = world && !world->IsUnreachable();
+                }
+                catch (...)
+                {
+                    world_available = false;
+                }
+            }
+            Json dumpers = json_object();
+            const auto add = [&](std::string_view kind, std::string output, std::string prerequisites) {
+                Json item = json_object();
+                item["available"] = available;
+                item["availability"] = available ? "available" : "unavailable";
+                item["outputLocation"] = std::move(output);
+                item["executor"] = "UE4SS event loop";
+                item["thread"] = "UE4SS event-loop thread; the MCP request thread is not blocked";
+                item["cancellation"] = "queued-only; non-cooperative after the C++ dumper entrance begins";
+                item["concurrency"] = "exclusive across all dumper kinds";
+                item["prerequisites"] = std::move(prerequisites);
+                dumpers[std::string{kind}] = std::move(item);
+            };
+            add("objects",
+                dumper_relative_output(std::filesystem::path{m_program.get_object_dumper_output_directory()} / UE4SSProgram::m_object_dumper_file_name),
+                "DevelopmentMode=1, initialized GUObjectArray and a live UE4SS event loop");
+            add("cxxHeaders",
+                dumper_relative_output(working_directory / "CXXHeaderDump"),
+                "DevelopmentMode=1, initialized reflection data and a live UE4SS event loop; settings may load assets");
+            add("uhtHeaders",
+                dumper_relative_output(working_directory / "UHTHeaderDump"),
+                "DevelopmentMode=1, initialized reflection data and a live UE4SS event loop");
+            add("luaTypes",
+                dumper_relative_output(working_directory / "Mods" / "shared" / "types"),
+                "DevelopmentMode=1, initialized reflection data and a live UE4SS event loop; settings may load assets");
+            add("usmap", "*.usmap", "DevelopmentMode=1, initialized reflection data, KismetSystemLibrary and a live UE4SS event loop");
+            add("actors", "*-ue4ss_actor_data.csv", "DevelopmentMode=1, a loaded World with actor instances and a live UE4SS event loop");
+            add("staticMeshes", "*-ue4ss_static_mesh_data.csv", "DevelopmentMode=1, a loaded World with StaticMeshActor instances and a live UE4SS event loop");
+            dumpers["actors"]["available"] = available && world_available;
+            dumpers["actors"]["availability"] = available && world_available ? "available" : "unavailable";
+            dumpers["staticMeshes"]["available"] = available && world_available;
+            dumpers["staticMeshes"]["availability"] = available && world_available ? "available" : "unavailable";
+
+            Json profile = json_object();
+            profile["workingDirectory"] = working_directory.generic_string();
+            profile["developmentMode"] = m_development_mode;
+            profile["runtimeInitialized"] = runtime_initialized;
+            profile["eventLoopAvailable"] = event_loop_available;
+            profile["worldAvailable"] = world_available;
+            profile["dumpers"] = std::move(dumpers);
+            profile["artifactLimit"] = 1000;
+            return profile;
+        }
+
+        auto scan_dumper_files() const -> DumperFileSnapshot
+        {
+            DumperFileSnapshot files{};
+            const auto root = dumper_working_directory();
+            std::error_code error;
+            std::filesystem::recursive_directory_iterator iterator{root, std::filesystem::directory_options::skip_permission_denied, error};
+            const std::filesystem::recursive_directory_iterator end{};
+            while (iterator != end)
+            {
+                error.clear();
+                if (iterator->is_regular_file(error) && !error)
+                {
+                    const auto relative = iterator->path().lexically_relative(root).generic_string();
+                    DumperFileState state{};
+                    state.size = iterator->file_size(error);
+                    if (!error)
+                    {
+                        const auto modified = iterator->last_write_time(error);
+                        if (!error)
+                        {
+                            const auto system_time = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                                    modified - decltype(modified)::clock::now() + std::chrono::system_clock::now());
+                            state.modified_time_milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(system_time.time_since_epoch()).count();
+                            files[relative] = state;
+                        }
+                    }
+                }
+                error.clear();
+                iterator.increment(error);
+            }
+            return files;
+        }
+
+        auto dumper_artifact_result(const DumperFileSnapshot& before, const DumperFileSnapshot& after) const -> Json
+        {
+            struct ChangedFile
+            {
+                std::string relative_path;
+                DumperFileState state;
+                bool created{};
+            };
+            std::vector<ChangedFile> changed{};
+            changed.reserve(after.size());
+            for (const auto& [relative_path, state] : after)
+            {
+                const auto previous = before.find(relative_path);
+                if (previous == before.end() || previous->second.size != state.size ||
+                    previous->second.modified_time_milliseconds != state.modified_time_milliseconds)
+                {
+                    changed.emplace_back(relative_path, state, previous == before.end());
+                }
+            }
+            std::ranges::sort(changed, {}, &ChangedFile::relative_path);
+
+            JsonArray artifacts{};
+            artifacts.reserve(std::min<size_t>(changed.size(), 1000));
+            for (size_t index = 0; index < changed.size() && index < 1000; ++index)
+            {
+                const auto& changed_file = changed[index];
+                Json artifact = json_object();
+                artifact["relativePath"] = changed_file.relative_path;
+                artifact["size"] = changed_file.state.size;
+                artifact["modifiedTimeUnixMilliseconds"] = changed_file.state.modified_time_milliseconds;
+                artifact["change"] = changed_file.created ? "created" : "modified";
+                artifacts.emplace_back(std::move(artifact));
+            }
+
+            Json result = json_object();
+            result["workingDirectory"] = dumper_working_directory().generic_string();
+            result["artifacts"] = std::move(artifacts);
+            result["artifactCount"] = changed.size();
+            result["truncated"] = changed.size() > 1000;
+            return result;
+        }
+
+        auto execute_dumper(const std::string& kind) -> void
+        {
+            const auto working_directory = dumper_working_directory();
+            if (kind == "objects")
+            {
+                UE4SSProgram::dump_all_objects_and_properties(
+                        (std::filesystem::path{m_program.get_object_dumper_output_directory()} / UE4SSProgram::m_object_dumper_file_name).native());
+            }
+            else if (kind == "cxxHeaders")
+            {
+                m_program.generate_cxx_headers(working_directory / "CXXHeaderDump");
+            }
+            else if (kind == "uhtHeaders")
+            {
+                m_program.generate_uht_compatible_headers();
+            }
+            else if (kind == "luaTypes")
+            {
+                m_program.generate_lua_types(working_directory / "Mods" / "shared" / "types");
+            }
+            else if (kind == "usmap")
+            {
+                OutTheShade::generate_usmap();
+            }
+            else if (kind == "actors")
+            {
+                GUI::Dumpers::call_generate_all_actor_file();
+            }
+            else if (kind == "staticMeshes")
+            {
+                GUI::Dumpers::call_generate_static_mesh_file();
+            }
+            else
+            {
+                throw McpError{"transport.invalid_arguments", fmt::format("Unsupported dumper kind '{}'", kind)};
+            }
+        }
+
+        auto is_dumper_kind(std::string_view kind) const -> bool
+        {
+            static constexpr std::array<std::string_view, 7> kinds{"objects", "cxxHeaders", "uhtHeaders", "luaTypes", "usmap", "actors", "staticMeshes"};
+            return std::ranges::find(kinds, kind) != kinds.end();
+        }
+
+        auto is_expected_dumper_artifact(std::string_view kind, std::string_view relative_path) const -> bool
+        {
+            if (kind == "objects")
+            {
+                return relative_path ==
+                       dumper_relative_output(std::filesystem::path{m_program.get_object_dumper_output_directory()} / UE4SSProgram::m_object_dumper_file_name);
+            }
+            if (kind == "cxxHeaders")
+            {
+                return relative_path.starts_with("CXXHeaderDump/");
+            }
+            if (kind == "uhtHeaders")
+            {
+                return relative_path.starts_with("UHTHeaderDump/");
+            }
+            if (kind == "luaTypes")
+            {
+                return relative_path.starts_with("Mods/shared/types/");
+            }
+            if (kind == "usmap")
+            {
+                return relative_path.find('/') == std::string_view::npos && relative_path.ends_with(".usmap");
+            }
+            if (kind == "actors")
+            {
+                return relative_path.find('/') == std::string_view::npos && relative_path.ends_with("-ue4ss_actor_data.csv");
+            }
+            return kind == "staticMeshes" && relative_path.find('/') == std::string_view::npos && relative_path.ends_with("-ue4ss_static_mesh_data.csv");
+        }
+
+        auto count_expected_dumper_artifacts(std::string_view kind, const DumperFileSnapshot& before, const DumperFileSnapshot& after) const -> size_t
+        {
+            size_t count{};
+            for (const auto& [relative_path, state] : after)
+            {
+                const auto previous = before.find(relative_path);
+                const bool changed = previous == before.end() || previous->second.size != state.size ||
+                                     previous->second.modified_time_milliseconds != state.modified_time_milliseconds;
+                if (changed && is_expected_dumper_artifact(kind, relative_path))
+                {
+                    ++count;
+                }
+            }
+            return count;
+        }
+
+        auto finalize_dumper_task(const std::shared_ptr<AsyncTask>& task,
+                                  const std::string& task_id,
+                                  const std::string& kind,
+                                  const DumperFileSnapshot& before,
+                                  std::string status,
+                                  std::optional<std::string> error_message = std::nullopt) -> void
+        {
+            const auto after = scan_dumper_files();
+            const auto expected_artifact_count = count_expected_dumper_artifacts(kind, before, after);
+            if (status == "succeeded" && expected_artifact_count == 0)
+            {
+                status = "failed";
+                error_message = fmt::format("The {} dumper returned without creating or modifying an expected output file", kind);
+            }
+            auto result = dumper_artifact_result(before, after);
+            result["expectedArtifactCount"] = expected_artifact_count;
+            const auto artifacts = *find_member(result, "artifacts");
+            {
+                std::lock_guard lock{task->mutex};
+                task->state["status"] = status;
+                if (status == "succeeded")
+                {
+                    task->state["progress"] = 1.0;
+                }
+                task->state["currentAction"] = nullptr;
+                task->state["cancellable"] = false;
+                task->state["executionPhase"] = status;
+                task->state["result"] = std::move(result);
+                task->state["actualChanges"] = artifacts;
+                if (error_message)
+                {
+                    Json error = json_object();
+                    error["code"] = "dumper.execution_failed";
+                    error["stage"] = kind;
+                    error["message"] = *error_message;
+                    error["retryable"] = false;
+                    task->state["errors"].get<JsonArray>().emplace_back(std::move(error));
+                }
+                Json output = json_object();
+                output["message"] = status == "succeeded"   ? "Dumper completed and filesystem evidence was collected"
+                                    : status == "cancelled" ? "Dumper was cancelled before its C++ entrance began"
+                                                            : "Dumper failed; filesystem evidence was still collected";
+                task->state["recentOutput"].get<JsonArray>().emplace_back(std::move(output));
+            }
+            m_dumper_task_active.store(false);
+            Json completed = json_object();
+            completed["taskId"] = task_id;
+            completed["status"] = std::move(status);
+            append_event("task.completed", std::move(completed));
+        }
+
+        auto start_dumper_task(const std::string& kind) -> Json
+        {
+            if (!is_dumper_kind(kind))
+            {
+                throw McpError{"transport.invalid_arguments", fmt::format("Unsupported dumper kind '{}'", kind)};
+            }
+            if (!Unreal::UnrealInitializer::StaticStorage::bIsInitialized)
+            {
+                throw McpError{"lifecycle.runtime_not_ready", "Unreal runtime is not initialized"};
+            }
+            if (!m_program.can_process_events())
+            {
+                throw McpError{"lifecycle.runtime_not_ready", "UE4SS event loop is not ready"};
+            }
+            bool expected = false;
+            if (!m_dumper_task_active.compare_exchange_strong(expected, true))
+            {
+                throw McpError{"dumper.busy", "Another dumper task is queued or running"};
+            }
+
+            const auto task_id = fmt::format("{}-task-{}", m_session_id, m_next_task_id.fetch_add(1));
+            auto task = std::make_shared<AsyncTask>();
+            task->execution_state = std::make_shared<std::atomic<PendingState>>(PendingState::Queued);
+            task->state["taskId"] = task_id;
+            task->state["sessionId"] = m_session_id;
+            task->state["kind"] = kind;
+            task->state["taskType"] = "dumper";
+            task->state["status"] = "running";
+            task->state["progress"] = 0.0;
+            task->state["currentAction"] = "scanning working directory before dump";
+            task->state["executionPhase"] = "queued";
+            task->state["cancellable"] = true;
+            task->state["cancellationPolicy"] = "queued-only; non-cooperative after the C++ dumper entrance begins";
+            task->state["cancelRequested"] = false;
+            task->state["recentOutput"] = JsonArray{};
+            task->state["actualChanges"] = JsonArray{};
+            task->state["result"] = json_object();
+            task->state["errors"] = JsonArray{};
+            {
+                std::lock_guard lock{m_tasks_mutex};
+                m_tasks.emplace(task_id, task);
+            }
+
+            Json queued = json_object();
+            queued["taskId"] = task_id;
+            queued["kind"] = kind;
+            append_event("task.queued", std::move(queued));
+            try
+            {
+                task->worker = std::jthread{[this, task, task_id, kind](std::stop_token stop_token) {
+                    const auto before = scan_dumper_files();
+                    auto execution_state = task->execution_state;
+                    if (stop_token.stop_requested() || task->cancel_requested.load())
+                    {
+                        auto expected_state = PendingState::Queued;
+                        execution_state->compare_exchange_strong(expected_state, PendingState::Cancelled);
+                    }
+
+                    auto completion = std::make_shared<std::promise<void>>();
+                    auto future = completion->get_future();
+                    if (execution_state->load() == PendingState::Queued)
+                    {
+                        {
+                            std::lock_guard lock{task->mutex};
+                            task->state["currentAction"] = "queued on UE4SS event loop";
+                            task->state["progress"] = 0.25;
+                        }
+                        try
+                        {
+                            m_program.queue_event([this, task, task_id, kind, execution_state, completion] {
+                                auto expected_state = PendingState::Queued;
+                                if (!execution_state->compare_exchange_strong(expected_state, PendingState::Running))
+                                {
+                                    return;
+                                }
+                                {
+                                    std::lock_guard lock{task->mutex};
+                                    task->state["currentAction"] = fmt::format("running {} dumper", kind);
+                                    task->state["executionPhase"] = "running";
+                                    task->state["progress"] = 0.5;
+                                    task->state["cancellable"] = false;
+                                }
+                                Json running = json_object();
+                                running["taskId"] = task_id;
+                                running["kind"] = kind;
+                                append_event("task.started", std::move(running));
+                                try
+                                {
+                                    execute_dumper(kind);
+                                    completion->set_value();
+                                }
+                                catch (...)
+                                {
+                                    completion->set_exception(std::current_exception());
+                                }
+                                execution_state->store(PendingState::Completed);
+                            });
+                        }
+                        catch (...)
+                        {
+                            execution_state->store(PendingState::Completed);
+                            completion->set_exception(std::current_exception());
+                        }
+                    }
+
+                    while (execution_state->load() == PendingState::Queued)
+                    {
+                        if (stop_token.stop_requested() || task->cancel_requested.load())
+                        {
+                            auto expected_state = PendingState::Queued;
+                            execution_state->compare_exchange_strong(expected_state, PendingState::Cancelled);
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+                    }
+                    if (execution_state->load() == PendingState::Cancelled)
+                    {
+                        finalize_dumper_task(task, task_id, kind, before, "cancelled");
+                        return;
+                    }
+
+                    while (execution_state->load() == PendingState::Running)
+                    {
+                        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+                    }
+                    try
+                    {
+                        future.get();
+                        finalize_dumper_task(task, task_id, kind, before, "succeeded");
+                    }
+                    catch (const std::exception& error)
+                    {
+                        finalize_dumper_task(task, task_id, kind, before, "failed", error.what());
+                    }
+                    catch (...)
+                    {
+                        finalize_dumper_task(task, task_id, kind, before, "failed", "The dumper threw a non-standard exception");
+                    }
+                }};
+            }
+            catch (...)
+            {
+                {
+                    std::lock_guard lock{m_tasks_mutex};
+                    m_tasks.erase(task_id);
+                }
+                m_dumper_task_active.store(false);
+                throw;
+            }
             return copy_task_state(task);
         }
 
@@ -1739,6 +2422,14 @@ namespace RC::Mcp
             {
                 operation();
             }
+            sample_property_watches();
+        }
+
+        auto log_cursor() const -> uint64_t
+        {
+            std::error_code error;
+            const auto size = std::filesystem::file_size(log_path(), error);
+            return error ? 0 : static_cast<uint64_t>(size);
         }
 
         auto execute_console(const std::string& command) -> Json
@@ -1749,13 +2440,20 @@ namespace RC::Mcp
                 throw McpError{"lifecycle.viewport_not_ready", "No live GameViewportClient was found"};
             }
 
-            Unreal::FOutputDevice output_device{};
+            constexpr size_t maximum_output_bytes = 65536;
+            BoundedOutputCapture output_device{maximum_output_bytes};
+            const auto log_cursor_before = log_cursor();
             const auto wide_command = ensure_str(command);
             const auto handled = viewport->ProcessConsoleExec(wide_command.c_str(), output_device, nullptr);
+            const auto log_cursor_after = log_cursor();
             Json result = json_object();
             result["command"] = command;
             result["handled"] = handled;
-            result["outputResource"] = "ue4ss://logs";
+            result["outputCaptureAvailable"] = true;
+            result["output"] = output_device.output();
+            result["outputTruncated"] = output_device.truncated();
+            result["logCursorBefore"] = log_cursor_before;
+            result["logCursorAfter"] = log_cursor_after;
             return result;
         }
 
@@ -2058,16 +2756,33 @@ namespace RC::Mcp
                 Unreal::UObjectArray::GetGUObjectArrayAddress() && m_game_thread_callback_id != Unreal::Hook::ERROR_ID ? "available" : "unavailable",
                 Unreal::UObjectArray::GetGUObjectArrayAddress() ? "GUObjectArray address is initialized" : "GUObjectArray address is null",
                 m_game_thread_callback_id != Unreal::Hook::ERROR_ID ? "initialized GUObjectArray" : "UEngine::Tick game-thread callback");
+            const bool asset_load_prerequisites =
+                    m_development_mode && Unreal::UObjectArray::GetGUObjectArrayAddress() && m_game_thread_callback_id != Unreal::Hook::ERROR_ID;
+            add("runtime.asset.load",
+                asset_load_prerequisites ? "available" : "unavailable",
+                asset_load_prerequisites ? "exact AssetRegistry GetAssetByObjectPath/GetAsset is scheduled on the game thread; registry is resolved per call"
+                                         : "asset-load structural prerequisites are incomplete",
+                !m_development_mode ? "DevelopmentMode=1"
+                                    : (!Unreal::UObjectArray::GetGUObjectArrayAddress() ? "initialized GUObjectArray" : "UEngine::Tick game-thread callback"));
 
             const bool has_started_lua_mod = std::ranges::any_of(m_program.m_mods, [](const auto& mod) {
                 const auto* lua_mod = dynamic_cast<const LuaMod*>(mod.get());
                 return lua_mod && lua_mod->is_started() && lua_mod->m_hook_lua;
+            });
+            const bool has_known_lua_path = !m_stopped_lua_mod_paths.empty() || std::ranges::any_of(m_program.m_mods, [](const auto& mod) {
+                return dynamic_cast<const LuaMod*>(mod.get()) != nullptr;
             });
             add("lua.execute",
                 m_development_mode && has_started_lua_mod && m_game_thread_callback_id != Unreal::Hook::ERROR_ID ? "available" : "degraded",
                 m_development_mode ? "development mode enabled" : "development mode disabled",
                 has_started_lua_mod ? "UEngine::Tick game-thread callback" : "DevelopmentMode=1 and a started Lua mod hook state");
             add("lua.reload", m_development_mode ? "available" : "unavailable", "UE4SS Lua reinstall path", "DevelopmentMode=1");
+            const bool lua_control_executor_ready = m_development_mode && m_program.can_process_events();
+            add("lua.mod.control",
+                lua_control_executor_ready && has_known_lua_path ? "available" : (lua_control_executor_ready ? "degraded" : "unavailable"),
+                has_known_lua_path ? "known Lua mod path with UE4SS runtime start/uninstall/reinstall paths"
+                                   : "no Lua mod path is currently known to this MCP session",
+                !m_development_mode ? "DevelopmentMode=1" : (!m_program.can_process_events() ? "running UE4SS event loop" : "known Lua mod path"));
             add("lua.debug",
                 m_development_mode && has_started_lua_mod && m_game_thread_callback_id != Unreal::Hook::ERROR_ID ? "available" : "degraded",
                 "hook-state line debugger with conditional breakpoints, paused locals and stepping",
@@ -2079,8 +2794,9 @@ namespace RC::Mcp
                 m_development_mode ? "loaded compatible KismetDebuggerMod" : "DevelopmentMode=1");
             add("runtime.console.execute",
                 m_development_mode && m_game_thread_callback_id != Unreal::Hook::ERROR_ID ? "available" : "unavailable",
-                m_game_thread_callback_id != Unreal::Hook::ERROR_ID ? "UEngine::Tick game-thread callback is registered"
-                                                                    : "UEngine::Tick game-thread callback is unavailable",
+                m_game_thread_callback_id != Unreal::Hook::ERROR_ID
+                        ? "UEngine::Tick game-thread callback is registered; bounded ProcessConsoleExec output capture is installed per command"
+                        : "UEngine::Tick game-thread callback is unavailable",
                 m_development_mode ? "live GameViewportClient" : "DevelopmentMode=1");
             add("runtime.process_event.observe",
                 m_development_mode && UE4SSRuntime::IsProcessEventAvailable() ? "available" : "unavailable",
@@ -2221,6 +2937,263 @@ namespace RC::Mcp
             auto* value = property->ContainerPtrToValuePtr<void>(object);
             property->ExportTextItem(exported, value, value, object, 0);
             return to_string(StringType{*exported});
+        }
+
+        auto append_property_watch_event_locked(PropertyWatch& watch,
+                                                std::string_view kind,
+                                                const std::optional<std::string>& value,
+                                                std::string_view error_code = {},
+                                                std::string_view message = {}) -> void
+        {
+            Json event = json_object();
+            event["sequence"] = watch.next_sequence++;
+            event["timestampMs"] =
+                    static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            event["kind"] = std::string{kind};
+            if (value)
+            {
+                event["value"] = *value;
+            }
+            else
+            {
+                event["value"] = nullptr;
+            }
+            if (!error_code.empty())
+            {
+                event["errorCode"] = std::string{error_code};
+                event["message"] = std::string{message};
+            }
+            watch.history.emplace_back(std::move(event));
+            while (watch.history.size() > watch.history_limit)
+            {
+                watch.history.pop_front();
+            }
+        }
+
+        auto start_property_watch(const std::string& handle, const std::string& property_name, size_t history_limit, bool emit_unchanged) -> Json
+        {
+            auto* object = resolve_object_handle(handle);
+            auto* property = object->GetPropertyByNameInChain(ensure_str(property_name).c_str());
+            if (!property)
+            {
+                throw McpError{"property.not_found", fmt::format("Property '{}' was not found on the resolved object", property_name)};
+            }
+            auto initial_value = export_property_value(object, property);
+
+            PropertyWatch watch{};
+            watch.id = fmt::format("property-watch-{}", m_next_property_watch_id.fetch_add(1));
+            watch.handle = handle;
+            watch.property_name = property_name;
+            watch.history_limit = history_limit;
+            watch.emit_unchanged = emit_unchanged;
+            watch.last_value = initial_value;
+            append_property_watch_event_locked(watch, "value", watch.last_value);
+
+            Json result = json_object();
+            result["watchId"] = watch.id;
+            result["handle"] = watch.handle;
+            result["propertyName"] = watch.property_name;
+            result["historyLimit"] = static_cast<uint64_t>(watch.history_limit);
+            result["emitUnchanged"] = watch.emit_unchanged;
+            result["active"] = true;
+            result["initialSequence"] = static_cast<uint64_t>(1);
+            {
+                std::lock_guard lock{m_property_watches_mutex};
+                m_property_watch_order.emplace_back(watch.id);
+                m_property_watches.emplace(watch.id, std::move(watch));
+            }
+            return result;
+        }
+
+        auto property_watches_snapshot() const -> Json
+        {
+            JsonArray watches{};
+            std::lock_guard lock{m_property_watches_mutex};
+            watches.reserve(m_property_watch_order.size());
+            for (const auto& id : m_property_watch_order)
+            {
+                const auto iterator = m_property_watches.find(id);
+                if (iterator == m_property_watches.end())
+                {
+                    continue;
+                }
+                const auto& watch = iterator->second;
+                const auto oldest_sequence = watch.history.empty() ? watch.next_sequence : find_member(watch.history.front(), "sequence")->get<uint64_t>();
+                Json item = json_object();
+                item["watchId"] = watch.id;
+                item["handle"] = watch.handle;
+                item["propertyName"] = watch.property_name;
+                item["historyLimit"] = static_cast<uint64_t>(watch.history_limit);
+                item["emitUnchanged"] = watch.emit_unchanged;
+                item["active"] = watch.active;
+                item["expired"] = watch.expired;
+                item["eventCount"] = static_cast<uint64_t>(watch.history.size());
+                item["oldestCursor"] = oldest_sequence > 0 ? oldest_sequence - 1 : 0;
+                item["newestSequence"] = watch.next_sequence - 1;
+                watches.emplace_back(std::move(item));
+            }
+            Json result = json_object();
+            result["watches"] = std::move(watches);
+            result["count"] = static_cast<uint64_t>(m_property_watches.size());
+            return result;
+        }
+
+        auto read_property_watch(const Json& arguments) const -> Json
+        {
+            const auto watch_id = required_string(arguments, "watchId");
+            const auto cursor_value = optional_integer(arguments, "cursor", 0);
+            const auto limit_value = optional_integer(arguments, "limit", 100);
+            if (cursor_value < 0)
+            {
+                throw McpError{"transport.invalid_arguments", "cursor must not be negative"};
+            }
+            if (limit_value < 1 || limit_value > 1000)
+            {
+                throw McpError{"transport.invalid_arguments", "limit must be between 1 and 1000"};
+            }
+            const auto cursor = static_cast<uint64_t>(cursor_value);
+            const auto limit = static_cast<size_t>(limit_value);
+
+            JsonArray events{};
+            uint64_t oldest_sequence{};
+            uint64_t newest_sequence{};
+            bool active{};
+            bool expired{};
+            {
+                std::lock_guard lock{m_property_watches_mutex};
+                const auto iterator = m_property_watches.find(watch_id);
+                if (iterator == m_property_watches.end())
+                {
+                    throw McpError{"property_watch.not_found", fmt::format("Property watch '{}' does not exist in this server session", watch_id)};
+                }
+                const auto& watch = iterator->second;
+                oldest_sequence = watch.history.empty() ? watch.next_sequence : find_member(watch.history.front(), "sequence")->get<uint64_t>();
+                newest_sequence = watch.next_sequence - 1;
+                active = watch.active;
+                expired = watch.expired;
+                events.reserve(std::min(limit, watch.history.size()));
+                for (const auto& event : watch.history)
+                {
+                    const auto sequence = find_member(event, "sequence")->get<uint64_t>();
+                    if (sequence > cursor && events.size() < limit)
+                    {
+                        events.emplace_back(event);
+                    }
+                }
+            }
+            const auto next_cursor = events.empty() ? cursor : find_member(events.back(), "sequence")->get<uint64_t>();
+            Json result = json_object();
+            result["watchId"] = watch_id;
+            result["events"] = std::move(events);
+            result["oldestCursor"] = oldest_sequence > 0 ? oldest_sequence - 1 : 0;
+            result["nextCursor"] = next_cursor;
+            result["newestSequence"] = newest_sequence;
+            result["cursorExpired"] = cursor + 1 < oldest_sequence;
+            result["truncated"] = next_cursor < newest_sequence;
+            result["active"] = active;
+            result["expired"] = expired;
+            return result;
+        }
+
+        auto stop_property_watch(const std::string& watch_id) -> Json
+        {
+            bool found{};
+            bool was_active{};
+            {
+                std::lock_guard lock{m_property_watches_mutex};
+                const auto iterator = m_property_watches.find(watch_id);
+                if (iterator != m_property_watches.end())
+                {
+                    found = true;
+                    was_active = iterator->second.active;
+                    iterator->second.active = false;
+                }
+            }
+            Json result = json_object();
+            result["watchId"] = watch_id;
+            result["found"] = found;
+            result["stopped"] = true;
+            result["wasActive"] = was_active;
+            return result;
+        }
+
+        auto sample_property_watches() -> void
+        {
+            struct PendingSample
+            {
+                std::string id;
+                std::string handle;
+                std::string property_name;
+            };
+            constexpr size_t maximum_samples_per_tick = 16;
+            constexpr size_t maximum_watch_slots_per_tick = 64;
+            std::vector<PendingSample> samples{};
+            {
+                std::lock_guard lock{m_property_watches_mutex};
+                const auto watch_count = m_property_watch_order.size();
+                samples.reserve(std::min(watch_count, maximum_samples_per_tick));
+                const auto slots_to_visit = std::min(watch_count, maximum_watch_slots_per_tick);
+                for (size_t visited{}; visited < slots_to_visit && samples.size() < maximum_samples_per_tick; ++visited)
+                {
+                    if (m_property_watch_rotation >= watch_count)
+                    {
+                        m_property_watch_rotation = 0;
+                    }
+                    const auto& id = m_property_watch_order[m_property_watch_rotation++];
+                    const auto iterator = m_property_watches.find(id);
+                    if (iterator != m_property_watches.end() && iterator->second.active)
+                    {
+                        samples.emplace_back(PendingSample{id, iterator->second.handle, iterator->second.property_name});
+                    }
+                }
+            }
+
+            for (const auto& sample : samples)
+            {
+                std::optional<std::string> value{};
+                std::string error_code{};
+                std::string error_message{};
+                try
+                {
+                    auto* object = resolve_object_handle(sample.handle);
+                    auto* property = object->GetPropertyByNameInChain(ensure_str(sample.property_name).c_str());
+                    if (!property)
+                    {
+                        throw McpError{"property.not_found", fmt::format("Property '{}' was not found on the resolved object", sample.property_name)};
+                    }
+                    value = export_property_value(object, property);
+                }
+                catch (const McpError& error)
+                {
+                    error_code = error.code();
+                    error_message = error.what();
+                }
+                catch (const std::exception& error)
+                {
+                    error_code = "property_watch.sample_failed";
+                    error_message = error.what();
+                }
+
+                std::lock_guard lock{m_property_watches_mutex};
+                const auto iterator = m_property_watches.find(sample.id);
+                if (iterator == m_property_watches.end() || !iterator->second.active)
+                {
+                    continue;
+                }
+                auto& watch = iterator->second;
+                if (!error_code.empty())
+                {
+                    append_property_watch_event_locked(watch, "expired", std::nullopt, error_code, error_message);
+                    watch.active = false;
+                    watch.expired = true;
+                    continue;
+                }
+                if (watch.emit_unchanged || !watch.last_value || *watch.last_value != *value)
+                {
+                    append_property_watch_event_locked(watch, "value", value);
+                }
+                watch.last_value = std::move(value);
+            }
         }
 
         auto inspect_object(const std::string& handle, size_t limit) -> Json
@@ -2410,59 +3383,340 @@ namespace RC::Mcp
             }
         }
 
-        auto find_objects(const std::string& class_name, size_t limit) -> Json
+        auto query_objects(const Json& arguments) -> Json
         {
             if (!Unreal::UObjectArray::GetGUObjectArrayAddress())
             {
                 throw McpError{"lifecycle.runtime_not_ready", "GUObjectArray is not initialized"};
             }
-            (void)world_snapshot();
+            if (!arguments.is_object())
+            {
+                throw McpError{"transport.invalid_arguments", "ue4ss_objects_query arguments must be an object"};
+            }
 
-            const Unreal::FName class_to_find{ensure_str(class_name)};
+            const auto optional_boolean = [&](std::string_view field, bool fallback) {
+                const auto* value = find_member(arguments, field);
+                if (!value)
+                {
+                    return fallback;
+                }
+                if (!value->is_boolean())
+                {
+                    throw McpError{"transport.invalid_arguments", fmt::format("Argument '{}' must be a boolean", field)};
+                }
+                return value->get<bool>();
+            };
+            const auto string_array = [&](std::string_view field) {
+                std::vector<std::string> values{};
+                const auto* value = find_member(arguments, field);
+                if (!value)
+                {
+                    return values;
+                }
+                if (!value->is_array())
+                {
+                    throw McpError{"transport.invalid_arguments", fmt::format("Argument '{}' must be an array of strings", field)};
+                }
+                const auto& array = value->get<JsonArray>();
+                if (array.size() > 128)
+                {
+                    throw McpError{"transport.invalid_arguments", fmt::format("Argument '{}' may contain at most 128 strings", field)};
+                }
+                values.reserve(array.size());
+                for (const auto& item : array)
+                {
+                    if (!item.is_string() || item.get<std::string>().empty())
+                    {
+                        throw McpError{"transport.invalid_arguments", fmt::format("Argument '{}' must contain only non-empty strings", field)};
+                    }
+                    values.emplace_back(item.get<std::string>());
+                }
+                return values;
+            };
+
+            struct TextFilter
+            {
+                std::string value{};
+                std::optional<std::regex> expression{};
+            };
+            const bool use_regex = optional_boolean("regex", false);
+            const bool case_sensitive = optional_boolean("caseSensitive", false);
+            const bool include_derived = optional_boolean("includeDerived", false);
+            const auto make_text_filter = [&](std::string_view field) -> std::optional<TextFilter> {
+                auto value = optional_string(arguments, field);
+                if (!value)
+                {
+                    return std::nullopt;
+                }
+                if (value->empty())
+                {
+                    throw McpError{"transport.invalid_arguments", fmt::format("Argument '{}' must not be empty", field)};
+                }
+                TextFilter filter{std::move(*value), std::nullopt};
+                if (use_regex)
+                {
+                    auto flags = std::regex_constants::ECMAScript;
+                    if (!case_sensitive)
+                    {
+                        flags |= std::regex_constants::icase;
+                    }
+                    try
+                    {
+                        filter.expression.emplace(filter.value, flags);
+                    }
+                    catch (const std::regex_error& error)
+                    {
+                        throw McpError{"transport.invalid_arguments",
+                                       fmt::format("Argument '{}' is not a valid ECMAScript regular expression: {}", field, error.what())};
+                    }
+                }
+                return filter;
+            };
+            const auto name_filter = make_text_filter("name");
+            const auto full_name_filter = make_text_filter("fullName");
+            const auto path_filter = make_text_filter("path");
+            const auto class_filter = make_text_filter("className");
+            const auto outer_filter = make_text_filter("outer");
+            const auto text_matches = [&](std::string_view candidate, const TextFilter& filter) {
+                if (filter.expression)
+                {
+                    return std::regex_search(candidate.begin(), candidate.end(), *filter.expression);
+                }
+                if (case_sensitive)
+                {
+                    return candidate.find(filter.value) != std::string_view::npos;
+                }
+                return std::search(candidate.begin(), candidate.end(), filter.value.begin(), filter.value.end(), [](char left, char right) {
+                           return std::tolower(static_cast<unsigned char>(left)) == std::tolower(static_cast<unsigned char>(right));
+                       }) != candidate.end();
+            };
+            const auto literal_equals = [&](std::string_view left, std::string_view right) {
+                return left.size() == right.size() && (case_sensitive || std::equal(left.begin(), left.end(), right.begin(), [](char lhs, char rhs) {
+                                                           return std::tolower(static_cast<unsigned char>(lhs)) == std::tolower(static_cast<unsigned char>(rhs));
+                                                       }));
+            };
+
+            const auto instance_mode = optional_string(arguments, "instanceMode").value_or("any");
+            if (instance_mode != "any" && instance_mode != "instances" && instance_mode != "nonInstances" && instance_mode != "classDefaultObjects")
+            {
+                throw McpError{"transport.invalid_arguments", "Argument 'instanceMode' must be any, instances, nonInstances or classDefaultObjects"};
+            }
+            const auto has_properties = string_array("hasProperties");
+            const auto property_types = string_array("propertyTypes");
+            const auto limit_value = optional_integer(arguments, "limit", 100);
+            if (limit_value < 1 || limit_value > 500)
+            {
+                throw McpError{"transport.invalid_arguments", "Argument 'limit' must be between 1 and 500"};
+            }
+            const auto limit = static_cast<size_t>(limit_value);
+            const auto cursor_value = optional_integer(arguments, "cursor", 0);
+            if (cursor_value < 0)
+            {
+                throw McpError{"transport.invalid_arguments", "Argument 'cursor' must be non-negative"};
+            }
+            const auto max_scan_value = optional_integer(arguments, "maxScanObjects", 50000);
+            if (max_scan_value < 1 || max_scan_value > 200000)
+            {
+                throw McpError{"transport.invalid_arguments", "Argument 'maxScanObjects' must be between 1 and 200000"};
+            }
+            const auto cursor = static_cast<uint64_t>(cursor_value);
+            const auto max_scan = static_cast<uint64_t>(max_scan_value);
+
+            std::optional<uintptr_t> address{};
+            std::optional<std::string> requested_address = optional_string(arguments, "address");
+            if (requested_address)
+            {
+                const auto normalized = trim(*requested_address);
+                const bool hexadecimal = normalized.size() > 2 && normalized[0] == '0' && (normalized[1] == 'x' || normalized[1] == 'X');
+                const auto digits = hexadecimal ? normalized.substr(2) : normalized;
+                uint64_t parsed{};
+                const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), parsed, hexadecimal ? 16 : 10);
+                if (digits.empty() || error != std::errc{} || end != digits.data() + digits.size() || parsed == 0 ||
+                    parsed > static_cast<uint64_t>(std::numeric_limits<uintptr_t>::max()))
+                {
+                    throw McpError{"transport.invalid_arguments", "Argument 'address' must be a non-zero hexadecimal (0x...) or decimal UObject address"};
+                }
+                address = static_cast<uintptr_t>(parsed);
+            }
+
+            const bool has_effective_filter = name_filter || full_name_filter || path_filter || class_filter || outer_filter || address ||
+                                              !has_properties.empty() || !property_types.empty() || instance_mode != "any";
+            if (!has_effective_filter)
+            {
+                throw McpError{"transport.invalid_arguments", "ue4ss_objects_query requires at least one effective filtering condition"};
+            }
+
+            Json query = json_object();
+            const auto record_text_filter = [&](std::string_view field, const std::optional<TextFilter>& filter) {
+                if (filter)
+                {
+                    query[std::string{field}] = filter->value;
+                }
+            };
+            record_text_filter("name", name_filter);
+            record_text_filter("fullName", full_name_filter);
+            record_text_filter("path", path_filter);
+            record_text_filter("className", class_filter);
+            record_text_filter("outer", outer_filter);
+            if (address)
+            {
+                query["address"] = fmt::format("0x{:X}", *address);
+            }
+            query["regex"] = use_regex;
+            query["caseSensitive"] = case_sensitive;
+            query["includeDerived"] = include_derived;
+            query["instanceMode"] = instance_mode;
+            query["limit"] = static_cast<uint64_t>(limit);
+            query["cursor"] = cursor;
+            query["maxScanObjects"] = max_scan;
+            Json has_properties_json = JsonArray{};
+            Json property_types_json = JsonArray{};
+            for (const auto& property : has_properties)
+            {
+                has_properties_json.get<JsonArray>().emplace_back(property);
+            }
+            for (const auto& type : property_types)
+            {
+                property_types_json.get<JsonArray>().emplace_back(type);
+            }
+            query["hasProperties"] = std::move(has_properties_json);
+            query["propertyTypes"] = std::move(property_types_json);
+
+            (void)world_snapshot();
+            std::vector<StringType> reflected_property_names{};
+            reflected_property_names.reserve(has_properties.size());
+            for (const auto& property : has_properties)
+            {
+                reflected_property_names.emplace_back(ensure_str(property));
+            }
+
             JsonArray objects{};
             objects.reserve(limit);
+            const auto object_count = static_cast<uint64_t>(Unreal::UObjectArray::GetNumElements());
+            const auto scan_end = std::min(object_count, cursor + max_scan);
+            uint64_t scanned{};
             uint64_t matched{};
+            uint64_t next_cursor = cursor;
             bool truncated{};
-            Unreal::UObjectGlobals::ForEachUObject([&](Unreal::UObject* object, ...) {
+            for (uint64_t current_position = cursor; current_position < scan_end; ++current_position)
+            {
+                ++scanned;
+                next_cursor = current_position + 1;
+                const auto index = static_cast<int32_t>(current_position);
+                auto* object_item = Unreal::UObjectArray::IndexToObject(index);
+                if (!object_item || !object_item->IsValid(false))
+                {
+                    continue;
+                }
+                auto* object = object_item->GetUObject();
+
                 if (!object || object->IsUnreachable())
                 {
-                    return LoopAction::Continue;
+                    continue;
+                }
+                if (object_item->GetUObject() != object)
+                {
+                    continue;
                 }
                 auto* object_class = object->GetClassPrivate();
                 if (!object_class)
                 {
-                    return LoopAction::Continue;
+                    continue;
                 }
 
-                bool class_matches = object_class->GetNamePrivate().Equals(class_to_find);
-                if (!class_matches)
+                const bool is_class_default = object->HasAnyFlags(Unreal::RF_ClassDefaultObject);
+                const bool is_instance = !object->HasAnyFlags(static_cast<Unreal::EObjectFlags>(Unreal::RF_ClassDefaultObject | Unreal::RF_ArchetypeObject)) &&
+                                         !object->IsA<Unreal::UStruct>() && !object->IsA<Unreal::UField>() && !object->IsA<Unreal::UPackage>();
+                if ((instance_mode == "instances" && !is_instance) || (instance_mode == "nonInstances" && is_instance) ||
+                    (instance_mode == "classDefaultObjects" && !is_class_default))
                 {
-                    for (Unreal::UStruct* super_struct : Unreal::TSuperStructRange(object_class))
+                    continue;
+                }
+                if (address && reinterpret_cast<uintptr_t>(object) != *address)
+                {
+                    continue;
+                }
+                if (name_filter && !text_matches(to_string(object->GetName()), *name_filter))
+                {
+                    continue;
+                }
+                if (full_name_filter && !text_matches(to_string(object->GetFullName()), *full_name_filter))
+                {
+                    continue;
+                }
+                if (path_filter && !text_matches(to_string(object->GetPathName()), *path_filter))
+                {
+                    continue;
+                }
+                if (outer_filter)
+                {
+                    auto* outer = object->GetOuterPrivate();
+                    if (!outer || !text_matches(to_string(outer->GetPathName()), *outer_filter))
                     {
-                        if (super_struct->GetNamePrivate().Equals(class_to_find))
-                        {
-                            class_matches = true;
-                            break;
-                        }
+                        continue;
                     }
                 }
-                if (!class_matches)
+                if (class_filter)
                 {
-                    return LoopAction::Continue;
+                    bool class_matches = text_matches(to_string(object_class->GetName()), *class_filter);
+                    if (!class_matches && include_derived)
+                    {
+                        for (auto* super : Unreal::TSuperStructRange(object_class))
+                        {
+                            if (super && text_matches(to_string(super->GetName()), *class_filter))
+                            {
+                                class_matches = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!class_matches)
+                    {
+                        continue;
+                    }
+                }
+                bool has_all_properties = true;
+                for (const auto& property_name : reflected_property_names)
+                {
+                    if (!object->GetPropertyByNameInChain(property_name.c_str()))
+                    {
+                        has_all_properties = false;
+                        break;
+                    }
+                }
+                if (!has_all_properties)
+                {
+                    continue;
+                }
+                if (!property_types.empty())
+                {
+                    std::vector<bool> found_types(property_types.size(), false);
+                    auto* property_owner = object->IsA<Unreal::UStruct>() ? static_cast<Unreal::UStruct*>(object) : static_cast<Unreal::UStruct*>(object_class);
+                    for (auto* property :
+                         Unreal::TFieldRange<Unreal::FProperty>(property_owner,
+                                                                Unreal::EFieldIterationFlags::IncludeSuper | Unreal::EFieldIterationFlags::IncludeDeprecated))
+                    {
+                        const auto property_type = to_string(property->GetClass().GetFName().ToString());
+                        for (size_t type_index = 0; type_index < property_types.size(); ++type_index)
+                        {
+                            if (!found_types[type_index] && literal_equals(property_type, property_types[type_index]))
+                            {
+                                found_types[type_index] = true;
+                            }
+                        }
+                    }
+                    if (std::ranges::find(found_types, false) != found_types.end())
+                    {
+                        continue;
+                    }
                 }
 
                 ++matched;
                 if (objects.size() >= limit)
                 {
+                    next_cursor = current_position;
                     truncated = true;
-                    return LoopAction::Break;
-                }
-
-                const auto index = object->GetInternalIndex();
-                auto* object_item = Unreal::UObjectArray::IndexToObject(index);
-                if (!object_item || !object_item->IsValid(false) || object_item->GetUObject() != object)
-                {
-                    return LoopAction::Continue;
+                    break;
                 }
 
                 const auto serial_number = Unreal::UObjectArray::AllocateSerialNumber(index);
@@ -2471,22 +3725,105 @@ namespace RC::Mcp
                 item["name"] = to_string(object->GetName());
                 item["fullName"] = to_string(object->GetFullName());
                 item["path"] = to_string(object->GetPathName());
-                item["class"] = to_string(object_class->GetName());
+                item["className"] = to_string(object_class->GetName());
+                if (auto* outer = object->GetOuterPrivate())
+                {
+                    item["outer"] = to_string(outer->GetPathName());
+                }
+                else
+                {
+                    item["outer"] = nullptr;
+                }
                 item["address"] = fmt::format("0x{:X}", reinterpret_cast<uintptr_t>(object));
                 item["worldGeneration"] = m_world_generation;
                 item["objectIndex"] = index;
                 item["serialNumber"] = serial_number;
                 item["lifecycle"] = "valid";
                 objects.emplace_back(std::move(item));
-                return LoopAction::Continue;
-            });
+            }
+            if (!truncated && next_cursor < object_count)
+            {
+                truncated = true;
+            }
 
             Json result = json_object();
-            result["className"] = class_name;
+            result["query"] = std::move(query);
             result["objects"] = std::move(objects);
             result["returned"] = static_cast<uint64_t>(result["objects"].get<JsonArray>().size());
-            result["matchedBeforeLimit"] = matched;
+            result["matched"] = matched;
+            result["scanned"] = scanned;
             result["truncated"] = truncated;
+            if (truncated)
+            {
+                result["nextCursor"] = next_cursor;
+            }
+            else
+            {
+                result["nextCursor"] = nullptr;
+            }
+            result["matchCountComplete"] = !truncated;
+            return result;
+        }
+        auto load_asset(const std::string& object_path) -> Json
+        {
+            if (!Unreal::UObjectArray::GetGUObjectArrayAddress())
+            {
+                throw McpError{"lifecycle.runtime_not_ready", "GUObjectArray is not initialized"};
+            }
+            (void)world_snapshot();
+
+            auto* asset_registry = static_cast<Unreal::UAssetRegistry*>(Unreal::UAssetRegistryHelpers::GetAssetRegistry().ObjectPointer);
+            if (!asset_registry)
+            {
+                throw McpError{"asset.registry_unavailable", "Unreal AssetRegistry is unavailable"};
+            }
+
+            const Unreal::FName asset_name{ensure_str(object_path), Unreal::FNAME_Add};
+            Unreal::FAssetData asset_data = asset_registry->GetAssetByObjectPath(asset_name);
+            const bool was_found =
+                    (Unreal::Version::IsAtMost(5, 0) && asset_data.ObjectPath().GetComparisonIndex()) || asset_data.PackageName().GetComparisonIndex();
+            if (!was_found)
+            {
+                throw McpError{"asset.not_found", fmt::format("AssetRegistry has no asset at exact object path '{}'", object_path)};
+            }
+
+            auto* loaded_asset = Unreal::UAssetRegistryHelpers::GetAsset(asset_data);
+            if (!loaded_asset || loaded_asset->IsUnreachable())
+            {
+                throw McpError{"asset.load_failed", fmt::format("Asset '{}' was found but could not be loaded as a UObject", object_path)};
+            }
+
+            const auto index = loaded_asset->GetInternalIndex();
+            auto* object_item = Unreal::UObjectArray::IndexToObject(index);
+            if (!object_item || !object_item->IsValid(false) || object_item->GetUObject() != loaded_asset)
+            {
+                throw McpError{"asset.load_failed", fmt::format("Asset '{}' loaded without a valid GUObjectArray identity", object_path)};
+            }
+            auto* object_class = loaded_asset->GetClassPrivate();
+            if (!object_class)
+            {
+                throw McpError{"asset.load_failed", fmt::format("Asset '{}' loaded without a reflected class", object_path)};
+            }
+
+            const auto serial_number = Unreal::UObjectArray::AllocateSerialNumber(index);
+            const auto handle = fmt::format("{}:{}:{}:{}", m_session_id, m_world_generation, index, serial_number);
+            Json identity = json_object();
+            identity["handle"] = handle;
+            identity["name"] = to_string(loaded_asset->GetName());
+            identity["fullName"] = to_string(loaded_asset->GetFullName());
+            identity["path"] = to_string(loaded_asset->GetPathName());
+            identity["class"] = to_string(object_class->GetName());
+            identity["worldGeneration"] = m_world_generation;
+            identity["objectIndex"] = index;
+            identity["serialNumber"] = serial_number;
+            identity["lifecycle"] = "valid";
+
+            Json result = json_object();
+            result["objectPath"] = object_path;
+            result["wasFound"] = true;
+            result["didLoad"] = true;
+            result["handle"] = handle;
+            result["identity"] = std::move(identity);
             return result;
         }
 
@@ -2605,13 +3942,18 @@ namespace RC::Mcp
                 auto* lua_mod = dynamic_cast<LuaMod*>(mod.get());
                 if (lua_mod && to_string(lua_mod->get_name()) == mod_name)
                 {
+
                     reloaded_mod = lua_mod;
                     break;
                 }
             }
-            if (!reloaded_mod)
+            if (!reloaded_mod || !reloaded_mod->is_started())
             {
-                throw McpError{"mod.reload_failed", fmt::format("Lua mod '{}' disappeared during reload", mod_name)};
+                if (reloaded_mod)
+                {
+                    m_program.queue_uninstall_mod(reloaded_mod);
+                }
+                throw McpError{"mod.reload_failed", fmt::format("Lua mod '{}' did not start successfully during reload", mod_name)};
             }
 
             Json result = json_object();
@@ -2622,6 +3964,135 @@ namespace RC::Mcp
             result["started"] = reloaded_mod->is_started();
             result["restartRequired"] = false;
             return result;
+        }
+        auto control_lua_mod(const std::string& mod_name, const std::string& action) -> Json
+        {
+            LuaMod* selected_mod{};
+            bool cpp_mod_found{};
+            for (const auto& mod : m_program.m_mods)
+            {
+                if (auto* lua_mod = dynamic_cast<LuaMod*>(mod.get()); lua_mod && to_string(lua_mod->get_name()) == mod_name)
+                {
+                    selected_mod = lua_mod;
+                    break;
+                }
+                if (auto* cpp_mod = dynamic_cast<CppMod*>(mod.get()); cpp_mod && to_string(cpp_mod->get_name()) == mod_name)
+                {
+                    cpp_mod_found = true;
+                }
+            }
+            if (!selected_mod && cpp_mod_found && !m_stopped_lua_mod_paths.contains(mod_name))
+            {
+                throw McpError{"mod.cpp_restart_required",
+                               fmt::format("C++ mod '{}' cannot be controlled at runtime; restart the game process to change it safely", mod_name)};
+            }
+
+            const auto state_from = [&](LuaMod* mod, const std::filesystem::path& path) {
+                Json state = json_object();
+                state["name"] = mod_name;
+                state["action"] = action;
+                state["path"] = path.generic_string();
+                state["type"] = "lua";
+                if (mod)
+                {
+                    state["id"] = static_cast<uint64_t>(mod->get_id());
+                }
+                else
+                {
+                    state["id"] = nullptr;
+                }
+                state["installed"] = mod && mod->is_installed();
+                state["started"] = mod && mod->is_started();
+                state["persisted"] = false;
+                state["restartRequired"] = false;
+                return state;
+            };
+
+            if (action == "restart")
+            {
+                if (!selected_mod)
+                {
+                    throw McpError{"mod.not_found", fmt::format("Installed Lua mod '{}' was not found for restart", mod_name)};
+                }
+                const auto path = selected_mod->get_path();
+                m_stopped_lua_mod_paths[mod_name] = path;
+                auto state = reload_lua_mod(mod_name);
+                state["name"] = mod_name;
+                state["action"] = action;
+                state["path"] = path.generic_string();
+                state["type"] = "lua";
+                state["persisted"] = false;
+                state["restartRequired"] = false;
+                return state;
+            }
+
+            if (action == "stop")
+            {
+                if (!selected_mod)
+                {
+                    const auto known = m_stopped_lua_mod_paths.find(mod_name);
+                    if (known == m_stopped_lua_mod_paths.end())
+                    {
+                        throw McpError{"mod.not_found", fmt::format("Lua mod '{}' was not found", mod_name)};
+                    }
+                    return state_from(nullptr, known->second);
+                }
+                const auto path = selected_mod->get_path();
+                m_stopped_lua_mod_paths[mod_name] = path;
+                m_program.queue_uninstall_mod(selected_mod);
+                LuaMod* remaining_mod{};
+                for (const auto& mod : m_program.m_mods)
+                {
+                    auto* lua_mod = dynamic_cast<LuaMod*>(mod.get());
+                    if (lua_mod && to_string(lua_mod->get_name()) == mod_name)
+                    {
+                        remaining_mod = lua_mod;
+                        break;
+                    }
+                }
+                return state_from(remaining_mod, path);
+            }
+
+            std::filesystem::path path;
+            if (selected_mod)
+            {
+                path = selected_mod->get_path();
+                m_stopped_lua_mod_paths[mod_name] = path;
+                if (selected_mod->is_started())
+                {
+                    return state_from(selected_mod, path);
+                }
+            }
+            else
+            {
+                const auto known = m_stopped_lua_mod_paths.find(mod_name);
+                if (known == m_stopped_lua_mod_paths.end())
+                {
+                    throw McpError{"mod.not_found", fmt::format("Lua mod '{}' has no known runtime path", mod_name)};
+                }
+                path = known->second;
+            }
+
+            m_program.queue_start_lua_mod_by_path(path);
+            LuaMod* started_mod{};
+            for (const auto& mod : m_program.m_mods)
+            {
+                auto* lua_mod = dynamic_cast<LuaMod*>(mod.get());
+                if (lua_mod && to_string(lua_mod->get_name()) == mod_name)
+                {
+                    started_mod = lua_mod;
+                    break;
+                }
+            }
+            if (!started_mod || !started_mod->is_started())
+            {
+                if (started_mod)
+                {
+                    m_program.queue_uninstall_mod(started_mod);
+                }
+                throw McpError{"mod.start_failed", fmt::format("Lua mod '{}' did not start successfully", mod_name)};
+            }
+            return state_from(started_mod, path);
         }
 
         auto attach_lua_debugger(const std::string& mod_name) -> Json
@@ -3259,6 +4730,8 @@ namespace RC::Mcp
         std::deque<Json> m_events{};
         mutable std::mutex m_tasks_mutex{};
         std::unordered_map<std::string, std::shared_ptr<AsyncTask>> m_tasks{};
+        std::unordered_map<std::string, std::filesystem::path> m_stopped_lua_mod_paths{};
+        std::atomic_bool m_dumper_task_active{false};
         std::atomic_bool m_running{};
         bool m_winsock_initialized{};
         std::atomic<SOCKET> m_listen_socket{INVALID_SOCKET};
@@ -3272,6 +4745,11 @@ namespace RC::Mcp
         Unreal::Hook::GlobalCallbackId m_game_thread_callback_id{Unreal::Hook::ERROR_ID};
         std::mutex m_game_thread_queue_mutex{};
         std::vector<std::function<void()>> m_game_thread_queue{};
+        std::atomic_uint64_t m_next_property_watch_id{1};
+        mutable std::mutex m_property_watches_mutex{};
+        std::unordered_map<std::string, PropertyWatch> m_property_watches{};
+        std::vector<std::string> m_property_watch_order{};
+        size_t m_property_watch_rotation{};
         std::atomic_uint64_t m_next_hook_id{1};
         std::atomic_bool m_kismet_enabled_by_mcp{false};
         std::atomic<const KismetDebuggerApiV1*> m_kismet_api{nullptr};
