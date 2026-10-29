@@ -1641,8 +1641,19 @@ namespace RC::LuaType
             LuaType::FName::construct(params.lua, *name);
             return;
         case Operation::Set: {
-            auto& lua_object = params.lua.get_userdata<LuaType::FName>(params.stored_at_index);
-            *name = lua_object.get_local_cpp_object();
+            if (params.lua.is_string(params.stored_at_index))
+            {
+                *name = Unreal::FName(ensure_str(params.lua.get_string(params.stored_at_index)), Unreal::FNAME_Add);
+            }
+            else if (luaL_testudata(params.lua.get_lua_state(), params.stored_at_index, "FNameUserdata"))
+            {
+                auto& lua_object = params.lua.get_userdata<LuaType::FName>(params.stored_at_index);
+                *name = lua_object.get_local_cpp_object();
+            }
+            else
+            {
+                params.throw_error("push_nameproperty", "NameProperty can only be set to a string or FName");
+            }
             return;
         }
         case Operation::GetParam:
@@ -1749,9 +1760,9 @@ namespace RC::LuaType
                 auto lua_string = params.lua.get_string(params.stored_at_index);
                 *string = Unreal::FUtf8String(reinterpret_cast<const Unreal::UTF8CHAR*>(lua_string.data()));
             }
-            else if (params.lua.is_userdata(params.stored_at_index))
+            else if (luaL_testudata(params.lua.get_lua_state(), params.stored_at_index, "FUtf8String"))
             {
-                auto& rhs = params.lua.get_userdata<LuaType::FUtf8String>(params.stored_at_index);
+                auto& rhs = params.lua.get_userdata<LuaType::TLuaStringBase<Unreal::FUtf8String, LuaType::FUtf8StringName>>(params.stored_at_index);
                 *string = rhs.get_local_cpp_object();
             }
             else
@@ -1791,9 +1802,9 @@ namespace RC::LuaType
                 auto lua_string = params.lua.get_string(params.stored_at_index);
                 *string = Unreal::FAnsiString(lua_string.data());
             }
-            else if (params.lua.is_userdata(params.stored_at_index))
+            else if (luaL_testudata(params.lua.get_lua_state(), params.stored_at_index, "FAnsiString"))
             {
-                auto& rhs = params.lua.get_userdata<LuaType::FAnsiString>(params.stored_at_index);
+                auto& rhs = params.lua.get_userdata<LuaType::TLuaStringBase<Unreal::FAnsiString, LuaType::FAnsiStringName>>(params.stored_at_index);
                 *string = rhs.get_local_cpp_object();
             }
             else

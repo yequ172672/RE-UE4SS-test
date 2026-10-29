@@ -2,6 +2,8 @@
 
 Returns a table of all game directories.
 
+On Windows, when the executable is outside the usual project `Binaries/Win64` directory, UE4SS also accepts a `-basedir=` launch argument pointing to an existing project `Binaries/Win64` directory with a sibling `Content` directory. The project appears as `Game` in the returned table.
+
 An example of an absolute path to `Win64`: `Q:\SteamLibrary\steamapps\common\Deep Rock Galactic\FSD\Binaries\Win64`.
 
 To get to the same directory, do `IterateGameDirectories().<Game Name>.Binaries.Win64`.

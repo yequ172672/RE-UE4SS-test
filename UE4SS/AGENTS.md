@@ -39,9 +39,11 @@
 - `include/<Area>` 与 `src/<Area>` 是同一个模块的接口与实现，搜索和修改必须成对检查。
 - `UE4SSProgram` 构造函数已有大量副作用；初始化顺序分析必须覆盖 constructor、`init()`、`update()`、`on_program_start()` 和 cleanup。
 - 新 Lua 类型按现有注册/封送/error 模式实现，并同步公开 Lua 文档。
+- UE 5.6 及以上的 UTF-8/ANSI 字符串属性处理器在属性表初始化时注册；属性类型可能延迟出现，注册名称时需保证可匹配后续加载的类型。
 - Hook 回调必须明确线程、可重入性、所有者和卸载/热重载失效路径。
 - 兼容性检查应产出能力级可用/不可用结果，不把单个签名、偏移或 Hook 失败扩大为全局拒绝。
 - 自动游戏兼容配置只覆盖声明的设置键；本地 MCP、GUI、热键和 Mod 配置保留在安装根设置中，布局/签名按选中目录局部覆盖。
+- Lua 游戏目录发现优先使用标准可执行文件布局；Windows 上的 `-basedir` 回退须确认项目的 `Binaries/Win64` 和 `Content` 存在，目录遍历及 LogicMods 创建共用此解析结果。
 - MCP 传输线程不得直接访问 UObject 或模组 Lua 状态；运行时命令分别调度到 UE4SS event loop 或有预算的 EngineTick game-thread 队列。
 - MCP 超时必须区分“尚未执行且已取消”和“已经执行、结果不确定”；非幂等操作不能在超时后静默迟到执行。
 

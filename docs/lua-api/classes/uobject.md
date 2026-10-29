@@ -165,6 +165,7 @@ The `UObject` class is the base class that most other Unreal Engine game objects
 ### SetPropertyValue(string MemberVariableName, auto NewValue)
 
 - Identical to `__newindex` metamethod (doing `UObject["ObjectMemberName"] = NewValue`)
+- An `FName` property accepts an `FName` value or a Lua string, which is converted using `FNAME_Add`.
 
 ### IsClass()
 

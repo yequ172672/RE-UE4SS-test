@@ -63,11 +63,58 @@
 
 #if PLATFORM_WINDOWS
 #include <Unreal/Core/Windows/AllowWindowsPlatformTypes.hpp>
+#include <shellapi.h>
 #endif
 #pragma warning(default : 4005)
 
 namespace RC
 {
+    // Some launchers keep the executable outside the Unreal project and pass its
+    // Binaries/Win64 directory as -basedir. Prefer the conventional layout and
+    // only accept a fallback that actually contains a project Content directory.
+    static auto find_game_project_directory(const std::filesystem::path& executable_directory) -> std::filesystem::path
+    {
+        auto project = executable_directory.parent_path().parent_path();
+        if (std::filesystem::is_directory(project / "Content"))
+        {
+            return project;
+        }
+#if PLATFORM_WINDOWS
+        int argc{};
+        auto argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (!argv)
+        {
+            return {};
+        }
+        std::filesystem::path candidate;
+        for (int i = 1; i < argc; ++i)
+        {
+            std::wstring_view argument{argv[i]};
+            constexpr std::wstring_view prefix{L"-basedir="};
+            if (argument.size() > prefix.size() && _wcsnicmp(argument.data(), prefix.data(), prefix.size()) == 0)
+            {
+                auto binaries = std::filesystem::path{argument.substr(prefix.size())}.lexically_normal();
+                if (binaries.filename().empty())
+                {
+                    binaries = binaries.parent_path();
+                }
+                auto possible_project = binaries.parent_path().parent_path();
+                if (std::filesystem::is_directory(binaries) && std::filesystem::is_directory(possible_project / "Content") &&
+                    _wcsicmp(binaries.filename().c_str(), L"Win64") == 0 &&
+                    _wcsicmp(binaries.parent_path().filename().c_str(), L"Binaries") == 0)
+                {
+                    candidate = possible_project;
+                }
+                break;
+            }
+        }
+        LocalFree(argv);
+        return candidate;
+#else
+        return {};
+#endif
+    }
+
     LuaMadeSimple::Lua* LuaStatics::console_executor{};
     bool LuaStatics::console_executor_enabled{};
 
@@ -2605,17 +2652,16 @@ Overloads:
 #1: IterateGameDirectories())"};
 
             std::filesystem::path game_executable_directory = UE4SSProgram::get_program().get_game_executable_directory();
-            auto game_content_dir = game_executable_directory.parent_path().parent_path() / "Content";
-            if (!std::filesystem::exists(game_content_dir))
+            auto game_project_directory = find_game_project_directory(game_executable_directory);
+            if (game_project_directory.empty())
             {
-                Output::send<LogLevel::Warning>(STR("IterateGameDirectories: Could not locate the root directory because the directory structure is unknown "
-                                                    "(not <RootGamePath>/Game/Binaries/Win64)\n"));
+                Output::send<LogLevel::Warning>(STR("IterateGameDirectories: Could not locate a project Content directory from the executable or -basedir.\n"));
                 lua.set_nil();
                 return 1;
             }
 
-            auto game_name = game_executable_directory.parent_path().parent_path().filename();
-            auto game_root_directory = game_executable_directory.parent_path().parent_path().parent_path();
+            auto game_name = game_project_directory.filename();
+            auto game_root_directory = game_project_directory.parent_path();
             auto directories_table = lua.prepare_new_table();
 
             std::function<void(const std::filesystem::path&, LuaMadeSimple::Lua::Table&)> iterate_directory =
@@ -2866,12 +2912,13 @@ Overloads:
             try
             {
                 std::filesystem::path game_executable_directory = UE4SSProgram::get_program().get_game_executable_directory();
-                auto game_content_dir = game_executable_directory.parent_path().parent_path() / "Content";
-                if (!std::filesystem::exists(game_content_dir))
+                auto game_project_directory = find_game_project_directory(game_executable_directory);
+                if (game_project_directory.empty())
                 {
-                    lua.throw_error("CreateLogicModsDirectory: Could not locate the \"Content\" directory because the directory structure is unknown (not "
-                                    "<RootGamePath>/Game/Content)\n");
+                    lua.throw_error("CreateLogicModsDirectory: Could not locate a project Content directory from the executable or -basedir.\n");
                 }
+
+                auto game_content_dir = game_project_directory / "Content";
 
                 auto logic_mods_dir = game_content_dir / "Paks/LogicMods";
 

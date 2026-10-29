@@ -12,6 +12,11 @@ Added an optional loopback-only Python MCP host for scoped UE4SS settings profil
 
 Added automatic game-specific compatibility configuration selection from `CustomGameConfigs`. Configurations can declare executable, Unreal project, and install-directory selectors in `GameConfig.ini`; `UE4SS-compatibility.ini` overlays only game-specific settings without replacing local MCP, GUI, hotkey, or mod settings.
 
+Added a Phantom Blade Zero compatibility configuration for the tested UE 5.7 build. Game directory discovery can use a validated Windows `-basedir` argument when the executable is outside the project directory.
+
+FName properties and function arguments accept Lua strings and reject incompatible values instead of interpreting them as FName userdata.
+Registered the existing UTF-8 and ANSI string property handlers for Unreal Engine 5.6 and newer so struct fields can be read and written from Lua.
+
 
 Added CMake build system alongside Xmake - ([UE4SS #1067](https://github.com/UE4SS-RE/RE-UE4SS/pull/1067))
 - CMake >= 3.22 is now supported as the default build system

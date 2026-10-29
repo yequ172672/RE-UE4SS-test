@@ -10,6 +10,7 @@
 - **Return type:** `auto`
 - Attempts to call the `UFunction` and returns the result, if any.
 - If the `UFunction` is obtained without a context (e.g. from `StaticFindObject`), a `UObject` context must be passed as the first parameter.
+- An `FName` parameter accepts either an `FName` value or a Lua string; strings are converted using `FNAME_Add`.
 
 ## Methods
 
